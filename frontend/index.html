@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LaunchPad MRECW | Student Startup Marketplace & Innovation Hub</title>
+  <meta name="description" content="Official student startup marketplace and co-founder ecosystem for MRECW (Malla Reddy Engineering College for Women)." />
+
+  <!-- Google Fonts: Plus Jakarta Sans & Inter -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+
+  <header class="navbar">
+    <div class="container nav-container">
+      <div class="brand-wrapper" onclick="switchTab('home')">
+        <div class="brand-icon">🚀</div>
+        <div class="brand-col">
+          <div class="brand-name">
+            LaunchPad MRECW
+            <span class="brand-tag">WOMEN IN TECH</span>
+          </div>
+          <span class="brand-subtext">Malla Reddy Engineering College for Women • Innovation Cell</span>
+        </div>
+      </div>
+
+      <nav class="nav-links-row">
+        <button class="nav-link active" data-tab="home" onclick="switchTab('home')"><span>🚀</span> Startups</button>
+        <button class="nav-link" data-tab="cofounders" onclick="switchTab('cofounders')"><span>🤝</span> Co-Founders</button>
+        <button class="nav-link" data-tab="ailab" onclick="switchTab('ailab')"><span>🤖</span> AI Lab</button>
+        <button class="nav-link" data-tab="mentors" onclick="switchTab('mentors')"><span>🎓</span> Mentors</button>
+      </nav>
+
+      <div class="nav-actions">
+        <button class="btn btn-outline btn-sm" onclick="handleLaunchStartup()">+ Launch Startup</button>
+        <button id="auth-nav-button" class="btn btn-primary btn-sm hidden" onclick="handleAuthButton()">Sign in</button>
+      </div>
+    </div>
+  </header>
+
+  <div id="view-home" class="app-view-panel">
+    <section class="hero-section">
+      <canvas id="aurora-canvas"></canvas>
+      <div class="container hero-content">
+        <div class="hero-badge-pill">✨ MRECW Innovation & Incubation Center (IIC)</div>
+        <h1 class="hero-title">
+          Where <span class="hero-title-gradient">MRECW Women Innovators</span> Launch, Collaborate & Scale
+        </h1>
+        <p class="hero-subtitle">
+          The dedicated student venture marketplace for <strong>Malla Reddy Engineering College for Women</strong>. Showcase student ideas, find cross-department co-founders, and build real-world prototypes.
+        </p>
+
+        <div class="hero-stats-row">
+          <div class="hero-stat"><span class="stat-value" style="color: var(--primary-blue);">45+</span><span class="stat-label">Active Student Teams</span></div>
+          <div class="hero-stat"><span class="stat-value" style="color: var(--accent-cyan);">280+</span><span class="stat-label">MRECW Co-Founders</span></div>
+          <div class="hero-stat"><span class="stat-value" style="color: var(--secondary-violet);">₹18.5L+</span><span class="stat-label">Grants & Hackathon Wins</span></div>
+          <div class="hero-stat"><span class="stat-value" style="color: #f472b6;">6 Branches</span><span class="stat-label">Cross-Dept Synergy</span></div>
+        </div>
+
+        <div class="campus-ticker-strip">
+          <span class="ticker-label">MRECW Engineering Departments</span>
+          <div class="ticker-badges-row">
+            <span class="ticker-pill">CSE (Computer Science)</span>
+            <span class="ticker-pill">CSE - AI & ML</span>
+            <span class="ticker-pill">CSE - Data Science</span>
+            <span class="ticker-pill">IT (Information Technology)</span>
+            <span class="ticker-pill">ECE (Electronics & Comm)</span>
+            <span class="ticker-pill">EEE (Electrical & Electronics)</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <main class="container" style="padding-top: 2rem;">
+      <div class="spotlight-banner">
+        <div>
+          <span class="spotlight-badge">🏆 Startup of the Week</span>
+          <h2 class="spotlight-title">AgroVision AI — Team AgroSense (MRECW - CSE AI&ML)</h2>
+          <p class="spotlight-desc">
+            Autonomous on-device crop blight diagnosis tool helping smallholder farmers identify plant diseases in 300ms without internet. Developed by 3rd-year MRECW students.
+          </p>
+          <div style="margin-top: 1rem; display: flex; gap: 0.5rem;">
+            <button class="btn btn-primary btn-sm" onclick="openFeaturedPitch()">Read Pitch Deck ➔</button>
+            <button class="btn btn-outline btn-sm" onclick="openFeaturedJoinTeam()">Apply as AI Developer</button>
+          </div>
+        </div>
+        <img src="https://images.unsplash.com/photo-1625246333195-78d9c38ad449?w=360&auto=format&fit=crop&q=80" style="width: 240px; height: 135px; object-fit: cover; border-radius: 14px;" />
+      </div>
+
+      <div class="section-header-row">
+        <div>
+          <h2 class="section-title">Explore MRECW Student Ventures</h2>
+          <p class="section-desc">Browse student ventures across 8 technical domains built by student teams at MRECW.</p>
+        </div>
+        <div class="filter-controls-group">
+          <div class="search-input-box">
+            <span class="search-icon-pos">🔍</span>
+            <input type="text" placeholder="Search startups, teams, or skills..." oninput="handleMarketplaceSearch(this.value)" />
+          </div>
+          <select class="form-select" style="width: auto;" onchange="handleMarketplaceCampus(this.value)">
+            <option value="all">🏢 All MRECW Departments</option>
+            <option value="CSE">CSE (Computer Science)</option>
+            <option value="AI & ML">CSE - AI & ML</option>
+            <option value="Data Science">CSE - Data Science</option>
+            <option value="IT">IT (Information Technology)</option>
+            <option value="ECE">ECE (Electronics & Comm)</option>
+            <option value="EEE">EEE (Electrical & Electronics)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="category-scroll-strip">
+        <button class="cat-chip active" data-category-filter onclick="handleCategoryFilter('all', this)">All Categories</button>
+        <button class="cat-chip" id="saved-filter" aria-pressed="false" onclick="toggleSavedFilter(this)">❤️ Saved</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('ai', this)">🤖 Artificial Intelligence</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('agritech', this)">🌱 Agriculture Tech</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('edtech', this)">📚 Education Tech</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('healthtech', this)">🩺 Healthcare</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('fintech', this)">💳 Financial Tech</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('sustainability', this)">🌍 Sustainability</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('ecommerce', this)">📦 E-Commerce</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('robotics', this)">🦾 Robotics</button>
+      </div>
+
+      <div class="startups-grid" id="marketplace-grid"></div>
+
+      <!-- Department Leaderboard -->
+      <div style="background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: 1.75rem; margin-bottom: 3.5rem;">
+        <h3 style="font-size: 1.3rem; font-weight: 800; color: #fff; margin-bottom: 0.25rem;">🏫 MRECW Department Startup Leaderboard</h3>
+        <p style="font-size: 0.825rem; color: var(--text-muted); margin-bottom: 1.25rem;">Ranking MRECW engineering departments by student startup traction and hackathon grants.</p>
+        <div style="overflow-x: auto;">
+          <table style="width: 100%; text-align: left; border-collapse: collapse;">
+            <thead>
+              <tr style="border-bottom: 1px solid var(--border-subtle); font-size: 0.75rem; color: var(--text-dim); text-transform: uppercase;">
+                <th style="padding: 0.6rem 1rem;">Rank</th>
+                <th style="padding: 0.6rem 1rem;">MRECW Department</th>
+                <th style="padding: 0.6rem 1rem;">Active Startups</th>
+                <th style="padding: 0.6rem 1rem;">Teams Formed</th>
+                <th style="padding: 0.6rem 1rem;">Grants Won</th>
+              </tr>
+            </thead>
+            <tbody id="leaderboard-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div id="view-cofounders" class="app-view-panel hidden container" style="padding-top: 3rem;">
+    <h2 class="section-title">MRECW Co-Founders & Talent Hub</h2>
+    <p class="section-desc" style="margin-bottom: 1.5rem;">Find passionate peer engineers and designers across MRECW departments.</p>
+    <div class="cofounders-grid" id="cofounders-grid"></div>
+  </div>
+
+  <div id="view-ailab" class="app-view-panel hidden container" style="padding-top: 3rem;">
+    <div id="ailab-container"></div>
+  </div>
+
+  <div id="view-mentors" class="app-view-panel hidden container" style="padding-top: 3rem;">
+    <h2 class="section-title">MRECW Mentors & Advisory Council</h2>
+    <p class="section-desc" style="margin-bottom: 1.5rem;">Book 1-on-1 sessions with IIC faculty leads and distinguished alumnae.</p>
+    <div class="cofounders-grid" id="mentors-grid"></div>
+  </div>
+
+  <!-- Modals -->
+  <div class="modal-overlay hidden" id="modal-post-startup">
+    <div class="modal-card">
+      <h3 style="font-size: 1.25rem; font-weight: 800; color: #fff; margin-bottom: 1rem;">🚀 Launch Your Startup (MRECW)</h3>
+      <form onsubmit="handlePostStartup(event)">
+        <div class="form-row">
+          <div class="form-group"><label>Startup Name *</label><input type="text" id="post-name" class="form-input" maxlength="100" placeholder="e.g. SheShield IoT" required /></div>
+          <div class="form-group"><label>Team Name *</label><input type="text" id="post-team" class="form-input" maxlength="100" placeholder="e.g. Team CyberNari" required /></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><label>Category *</label><select id="post-category" class="form-select"><option value="ai">AI</option><option value="agritech" selected>Agriculture Tech</option><option value="edtech">Education Tech</option><option value="healthtech">Healthcare</option><option value="fintech">FinTech</option><option value="sustainability">Sustainability</option><option value="ecommerce">E-Commerce</option><option value="robotics">Robotics</option></select></div>
+          <div class="form-group"><label>MRECW Department *</label><select id="post-university" class="form-select"><option value="CSE - AI & ML">CSE - AI & ML</option><option value="CSE">CSE</option><option value="Data Science">Data Science</option><option value="IT">IT</option><option value="ECE">ECE</option><option value="EEE">EEE</option></select></div>
+        </div>
+        <div class="form-group"><label>Tagline / Elevator Pitch *</label><input type="text" id="post-tagline" class="form-input" maxlength="300" placeholder="One line description..." required /></div>
+        <div class="form-group"><label>Role Needed in Team *</label><input type="text" id="post-looking-for" class="form-input" maxlength="150" placeholder="e.g. Python Developer / IoT Specialist" required /></div>
+        <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1rem;">
+          <button type="button" class="btn btn-outline" onclick="closeModal('modal-post-startup')">Cancel</button>
+          <button type="submit" class="btn btn-primary">Publish Venture</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="modal-overlay hidden" id="modal-startup-detail">
+    <div class="modal-card"><div id="modal-detail-body"></div></div>
+  </div>
+
+  <div class="modal-overlay hidden" id="modal-join-team">
+    <div class="modal-card">
+      <h3 style="font-size: 1.25rem; font-weight: 800; color: #fff; margin-bottom: 0.5rem;">🤝 Apply to Join Team</h3>
+      <p style="font-size: 0.85rem; color: #94a3b8; margin-bottom: 1rem;">Connect directly with the MRECW student founder.</p>
+      <form onsubmit="handleJoinApplication(event)">
+        <div class="form-group"><label for="applicant-name">Your Name *</label><input type="text" id="applicant-name" class="form-input" maxlength="100" required /></div>
+        <div class="form-group"><label for="applicant-email">MRECW Email *</label><input type="email" id="applicant-email" class="form-input" maxlength="254" required /></div>
+        <div class="form-group"><label for="application-message">Why do you want to join? *</label><textarea id="application-message" class="form-input" maxlength="1000" style="min-height: 80px;" required></textarea></div>
+        <div style="display: flex; justify-content: flex-end; gap: 0.5rem;"><button type="button" class="btn btn-outline" onclick="closeModal('modal-join-team')">Cancel</button><button type="submit" class="btn btn-primary">Send Application</button></div>
+      </form>
+    </div>
+  </div>
+
+  <div class="modal-overlay hidden" id="modal-auth">
+    <div class="modal-card">
+      <h3 style="font-size: 1.25rem; font-weight: 800; color: #fff; margin-bottom: 0.5rem;">🔐 MRECW account</h3>
+      <p class="section-desc" style="margin-bottom: 1rem;">Sign in to publish startups or apply to join a team.</p>
+      <form onsubmit="handleAuthSubmit(event)">
+        <div class="form-group">
+          <label for="auth-mode">Account action</label>
+          <select id="auth-mode" class="form-select" onchange="updateAuthFields()">
+            <option value="signin">Sign in</option>
+            <option value="signup">Create account</option>
+          </select>
+        </div>
+        <div id="auth-signup-fields" class="hidden">
+          <div class="form-group">
+            <label for="auth-name">Your name *</label>
+            <input id="auth-name" class="form-input" type="text" maxlength="100" autocomplete="name" />
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="auth-department">Department *</label>
+              <select id="auth-department" class="form-select">
+                <option value="CSE - AI & ML">CSE - AI & ML</option>
+                <option value="CSE">CSE</option>
+                <option value="Data Science">Data Science</option>
+                <option value="IT">IT</option>
+                <option value="ECE">ECE</option>
+                <option value="EEE">EEE</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="auth-major">Course / year</label>
+              <input id="auth-major" class="form-input" type="text" maxlength="100" placeholder="CSE '27" />
+            </div>
+          </div>
+        </div>
+        <div class="form-group">
+          <label for="auth-email">Email *</label>
+          <input id="auth-email" class="form-input" type="email" maxlength="254" autocomplete="email" required />
+        </div>
+        <div class="form-group">
+          <label for="auth-password">Password *</label>
+          <input id="auth-password" class="form-input" type="password" minlength="8" autocomplete="current-password" required />
+        </div>
+        <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
+          <button type="button" class="btn btn-outline" onclick="closeModal('modal-auth')">Cancel</button>
+          <button id="auth-submit" type="submit" class="btn btn-primary">Sign in</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.1/dist/umd/supabase.min.js" defer></script>
+  <script src="/js/supabase-config.js" defer></script>
+  <script src="/js/app.js" defer></script>
+</body>
+</html>
