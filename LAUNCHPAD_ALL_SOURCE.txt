@@ -1,0 +1,2726 @@
+LaunchPad MRECW - Consolidated Plain-Text Source
+Each section below reproduces one project file; section headers are not part of the original files.
+Private backend/.env and local database files are intentionally excluded.
+
+==================== BEGIN FILE: .gitignore ====================
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local databases and SQLite sidecar files
+*.db
+*.db-*
+
+==================== END FILE: .gitignore ====================
+
+==================== BEGIN FILE: README.md ====================
+# LaunchPad MRECW
+
+LaunchPad MRECW is a student startup marketplace and innovation hub for Malla Reddy Engineering College for Women. The frontend is built with HTML, CSS, and vanilla JavaScript; the Python HTTP API can use local SQLite or Supabase PostgreSQL.
+
+## Requirements
+
+- Python 3.10 or newer
+- A modern browser
+
+SQLite mode uses only the Python standard library. Supabase PostgreSQL mode dependencies are listed in `backend/requirements.txt`.
+
+## Run locally
+
+From the project root in PowerShell:
+
+```powershell
+python backend\server.py
+```
+
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000). Keep the server running while using the site. Stop it with `Ctrl+C`.
+
+Without `backend/.env`, the server uses `launchpad.db`, preserving existing records and seeding demo teams when missing. To use Supabase PostgreSQL, first apply [`supabase/schema.sql`](./supabase/schema.sql), then follow the [Supabase setup guide](./supabase/README.md) to configure `backend/.env`, the frontend public Auth key, and backend dependencies.
+
+## Project structure
+
+```text
+backend/
+  README.md
+  requirements.txt
+  .env.example
+  server.py
+frontend/
+  README.md
+  index.html
+  css/
+    styles.css
+  js/
+    app.js
+    supabase-config.js
+supabase/
+  README.md
+  schema.sql
+README.md
+```
+
+## API
+
+- `GET /api/health` — server readiness check
+- `GET /api/startups` — list persisted startups
+- `POST /api/startups` — publish a startup
+- `POST /api/applications` — apply to join a persisted startup
+
+In local SQLite mode, there is no user authentication. Supabase mode adds account registration/sign-in and authenticated startup/application writes. Co-founder, mentor, spotlight, leaderboard, and AI Lab content is sample/demo content; no external AI service is configured. Supabase starts with no sample startup records.
+
+The marketplace supports searching startup names, teams, descriptions, skills, departments, and stages. Use the **Saved** filter to revisit startups bookmarked in the current browser.
+
+The project includes a Supabase PostgreSQL schema in [`supabase/schema.sql`](./supabase/schema.sql). The frontend uses Supabase Auth, while startup and application data requests go through the Python API. Configure the private database URL and Auth verification settings in `backend/.env`; only the public anon/publishable key belongs in `frontend/js/supabase-config.js`. Follow [supabase/README.md](./supabase/README.md). Never put a database password or service-role key in the browser or GitHub.
+
+## Uploading to GitHub
+
+- `backend/.env` and local SQLite databases are excluded by `.gitignore`; keep them that way.
+- `backend/.env.example` contains placeholders for local setup and is safe to upload.
+- The Supabase publishable/anon key in `frontend/js/supabase-config.js` is designed to be public. Never put a database password, service-role key, or other secret there.
+- Review the sample/demo content before presenting the site as an official live MRECW service.
+
+Uploading this repository to GitHub does not deploy the site. GitHub Pages cannot run the Python API; deploy the Python backend to a Python-capable host, set its private environment variables there, and serve the frontend and `/api` on the same origin. Then configure the deployed origin in Supabase Auth URL settings.
+
+See [backend/README.md](./backend/README.md) and [frontend/README.md](./frontend/README.md) for component-specific notes.
+
+==================== END FILE: README.md ====================
+
+==================== BEGIN FILE: backend/server.py ====================
+import json
+import logging
+import os
+import re
+import sqlite3
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+
+
+ROOT = Path(__file__).resolve().parent.parent
+FRONTEND = ROOT / "frontend"
+DATABASE = ROOT / "launchpad.db"
+BACKEND_DIR = Path(__file__).resolve().parent
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+if load_dotenv:
+    load_dotenv(BACKEND_DIR / ".env")
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:
+    psycopg = None
+    dict_row = None
+
+DATABASE_ERRORS = (sqlite3.Error,) if psycopg is None else (sqlite3.Error, psycopg.Error)
+DATABASE_INTEGRITY_ERRORS = (
+    (sqlite3.IntegrityError,)
+    if psycopg is None
+    else (sqlite3.IntegrityError, psycopg.IntegrityError)
+)
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "").strip()
+HOST = os.environ.get("HOST", "127.0.0.1")
+PORT = int(os.environ.get("PORT", "8000"))
+
+CATEGORIES = {
+    "ai": "Artificial Intelligence",
+    "agritech": "Agriculture Tech",
+    "edtech": "Education Tech",
+    "healthtech": "Healthcare",
+    "fintech": "FinTech",
+    "sustainability": "Sustainability",
+    "ecommerce": "E-Commerce",
+    "robotics": "Robotics",
+}
+CATEGORY_SLUGS = {value.casefold(): key for key, value in CATEGORIES.items()}
+CATEGORY_SLUGS.update({"artificial intelligence": "ai", "agriculture tech": "agritech"})
+DEPARTMENTS = {"CSE - AI & ML", "CSE", "Data Science", "IT", "ECE", "EEE"}
+DEFAULT_AVATAR = (
+    "https://images.unsplash.com/photo-1534528741775-53994a69daeb"
+    "?w=100&auto=format&fit=crop&q=80"
+)
+DEFAULT_BANNER = (
+    "https://images.unsplash.com/photo-1519389950473-47ba0277781c"
+    "?w=600&auto=format&fit=crop&q=80"
+)
+
+SEED_STARTUPS = [
+    {
+        "name": "AgroVision AI",
+        "team_name": "Team AgroSense",
+        "tagline": "AI-powered crop disease detection & yield forecasting for smallholder farmers",
+        "category": "agritech",
+        "department": "CSE - AI & ML",
+        "looking_for": "Python / PyTorch AI Engineer",
+        "founder_name": "Keerthi Reddy",
+        "founder_major": "CSE - AI & ML '26",
+        "stage": "Prototype",
+        "problem": "Delayed crop diagnosis causes significant losses for smallholder farmers.",
+        "description": "An edge-based mobile model that diagnoses plant stress without an internet connection.",
+        "banner": "https://images.unsplash.com/photo-1625246333195-78d9c38ad449?w=600&auto=format&fit=crop&q=80",
+        "founder_avatar": DEFAULT_AVATAR,
+    },
+    {
+        "name": "SheShield IoT",
+        "team_name": "Team CyberNari",
+        "tagline": "A smart wearable pendant and discreet emergency SOS beacon for campus safety",
+        "category": "ai",
+        "department": "IT",
+        "looking_for": "Embedded IoT / Firmware Engineer",
+        "founder_name": "Bhavana Varma",
+        "founder_major": "Information Tech '25",
+        "stage": "Prototype",
+        "problem": "Students need faster access to help when traveling around campus.",
+        "description": "A wearable safety device that can send an emergency alert and location.",
+        "banner": "https://images.unsplash.com/photo-1518770660439-4636190af475?w=600&auto=format&fit=crop&q=80",
+        "founder_avatar": "https://images.unsplash.com/photo-1517841905240-472988babdf9?w=100&auto=format&fit=crop&q=80",
+    },
+    {
+        "name": "ExamGenie AI",
+        "team_name": "Team CodeCrafters",
+        "tagline": "An intelligent syllabus question bank and active-recall test generator",
+        "category": "edtech",
+        "department": "CSE",
+        "looking_for": "Full-Stack React Developer",
+        "founder_name": "Sravani Rao",
+        "founder_major": "CSE '26",
+        "stage": "MVP",
+        "problem": "Students spend hours finding relevant practice questions before exams.",
+        "description": "A study tool that turns course materials into focused mock tests.",
+        "banner": "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=600&auto=format&fit=crop&q=80",
+        "founder_avatar": "https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=100&auto=format&fit=crop&q=80",
+    },
+    {
+        "name": "PulseGuard Bio",
+        "team_name": "Team BioInnovators",
+        "tagline": "A wearable sensor for health and heat-stress awareness",
+        "category": "healthtech",
+        "department": "ECE",
+        "looking_for": "Mobile App Developer (Flutter)",
+        "founder_name": "Divya Nallamothu",
+        "founder_major": "ECE '26",
+        "stage": "Testing",
+        "problem": "Early signs of heat stress and changing vitals can go unnoticed.",
+        "description": "A wearable sensor concept that shares health readings with a companion app.",
+        "banner": "https://images.unsplash.com/photo-1576091160550-2173dba999ef?w=600&auto=format&fit=crop&q=80",
+        "founder_avatar": "https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=100&auto=format&fit=crop&q=80",
+    },
+    {
+        "name": "CampusSplit Pay",
+        "team_name": "Team FinSpire",
+        "tagline": "A shared-expense manager for hostel roommates and student teams",
+        "category": "fintech",
+        "department": "Data Science",
+        "looking_for": "UI/UX & Graphic Designer",
+        "founder_name": "Ananya Sharma",
+        "founder_major": "CSE - Data Science '27",
+        "stage": "Launch",
+        "problem": "Students need a simpler way to track shared bills and purchases.",
+        "description": "A group expense tracker that helps students keep shared costs organized.",
+        "banner": "https://images.unsplash.com/photo-1559526324-4b87b5e36e44?w=600&auto=format&fit=crop&q=80",
+        "founder_avatar": "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=100&auto=format&fit=crop&q=80",
+    },
+    {
+        "name": "EcoDorm Cycle",
+        "team_name": "Team EcoWarriors",
+        "tagline": "Campus food redistribution and a student pre-loved exchange",
+        "category": "sustainability",
+        "department": "EEE",
+        "looking_for": "Backend Developer (Node.js/Python)",
+        "founder_name": "Pooja Kulkarni",
+        "founder_major": "EEE '26",
+        "stage": "Prototype",
+        "problem": "Usable campus food and student goods often go to waste.",
+        "description": "A campus marketplace concept for redistributing food and pre-loved items.",
+        "banner": "https://images.unsplash.com/photo-1504674900247-0877df9cc836?w=600&auto=format&fit=crop&q=80",
+        "founder_avatar": "https://images.unsplash.com/photo-1524504388940-b1c1722653e1?w=100&auto=format&fit=crop&q=80",
+    },
+]
+
+
+def connect_database():
+    if DATABASE_URL:
+        if psycopg is None:
+            raise RuntimeError(
+                "PostgreSQL mode requires the backend requirements. Install backend/requirements.txt."
+            )
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+    connection = sqlite3.connect(DATABASE, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def initialize_database():
+    if DATABASE_URL:
+        if psycopg is None:
+            raise RuntimeError(
+                "PostgreSQL mode requires the backend requirements. Install backend/requirements.txt."
+            )
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            raise RuntimeError(
+                "Set SUPABASE_URL and SUPABASE_ANON_KEY in backend/.env for authenticated API access."
+            )
+        with connect_database() as connection:
+            tables = connection.execute(
+                """
+                SELECT
+                    to_regclass('public.startups') AS startups,
+                    to_regclass('public.applications') AS applications
+                """
+            ).fetchone()
+            if not tables["startups"] or not tables["applications"]:
+                raise RuntimeError(
+                    "Supabase tables are missing. Run supabase/schema.sql in the Supabase SQL Editor first."
+                )
+        logging.info("Using Supabase PostgreSQL database.")
+        return
+
+    with connect_database() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS startups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL CHECK (length(trim(name)) BETWEEN 1 AND 100),
+                team_name TEXT NOT NULL CHECK (length(trim(team_name)) BETWEEN 1 AND 100),
+                tagline TEXT NOT NULL CHECK (length(trim(tagline)) BETWEEN 1 AND 300),
+                category TEXT NOT NULL CHECK (length(trim(category)) BETWEEN 1 AND 80),
+                department TEXT NOT NULL CHECK (length(trim(department)) BETWEEN 1 AND 100),
+                looking_for TEXT NOT NULL CHECK (length(trim(looking_for)) BETWEEN 1 AND 150),
+                founder_name TEXT NOT NULL CHECK (length(trim(founder_name)) BETWEEN 1 AND 100),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        columns = {
+            "stage": "TEXT NOT NULL DEFAULT 'Prototype'",
+            "problem": "TEXT NOT NULL DEFAULT 'Student venture submitted by an MRECW team.'",
+            "description": "TEXT NOT NULL DEFAULT 'A student-led venture from MRECW.'",
+            "banner": f"TEXT NOT NULL DEFAULT '{DEFAULT_BANNER}'",
+            "founder_major": "TEXT NOT NULL DEFAULT 'MRECW Student'",
+            "founder_avatar": f"TEXT NOT NULL DEFAULT '{DEFAULT_AVATAR}'",
+        }
+        existing_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(startups)")
+        }
+        for column, definition in columns.items():
+            if column not in existing_columns:
+                connection.execute(f"ALTER TABLE startups ADD COLUMN {column} {definition}")
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                startup_id INTEGER NOT NULL,
+                applicant_name TEXT NOT NULL CHECK (length(trim(applicant_name)) BETWEEN 1 AND 100),
+                email TEXT NOT NULL CHECK (length(trim(email)) BETWEEN 3 AND 254),
+                message TEXT NOT NULL CHECK (length(trim(message)) BETWEEN 1 AND 1000),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (startup_id) REFERENCES startups(id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_applications_startup ON applications(startup_id)"
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_startup_email_unique
+            ON applications(startup_id, lower(email))
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_startups_category ON startups(category)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_startups_department ON startups(department)"
+        )
+
+        for startup in SEED_STARTUPS:
+            row = connection.execute(
+                "SELECT id FROM startups WHERE team_name = ? ORDER BY id LIMIT 1",
+                (startup["team_name"],),
+            ).fetchone()
+            metadata = (
+                startup["stage"],
+                startup["problem"],
+                startup["description"],
+                startup["banner"],
+                startup["founder_major"],
+                startup["founder_avatar"],
+            )
+            if row:
+                connection.execute(
+                    """
+                    UPDATE startups SET stage = ?, problem = ?, description = ?, banner = ?,
+                        founder_major = ?, founder_avatar = ?
+                    WHERE id = ?
+                    """,
+                    (*metadata, row["id"]),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO startups (
+                        name, team_name, tagline, category, department, looking_for,
+                        founder_name, stage, problem, description, banner, founder_major,
+                        founder_avatar
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        startup["name"],
+                        startup["team_name"],
+                        startup["tagline"],
+                        startup["category"],
+                        startup["department"],
+                        startup["looking_for"],
+                        startup["founder_name"],
+                        *metadata,
+                    ),
+                )
+
+
+def category_slug(category):
+    normalized = category.strip().casefold()
+    return CATEGORY_SLUGS.get(normalized, normalized.replace(" ", "-"))
+
+
+def startup_response(row):
+    return {
+        "id": f"startup-{row['id']}",
+        "name": row["name"],
+        "teamName": row["team_name"],
+        "tagline": row["tagline"],
+        "category": category_slug(row["category"]),
+        "stage": row["stage"],
+        "university": row["department"],
+        "founder": {
+            "name": row["founder_name"],
+            "major": row["founder_major"],
+            "avatar": row["founder_avatar"],
+        },
+        "banner": row["banner"],
+        "lookingFor": row["looking_for"],
+        "problem": row["problem"],
+        "description": row["description"],
+    }
+
+
+def required_text(payload, key, maximum):
+    value = payload.get(key)
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a text value.")
+    value = value.strip()
+    if not value or len(value) > maximum:
+        raise ValueError(f"{key} must be between 1 and {maximum} characters.")
+    return value
+
+
+def set_postgres_request_role(connection, role, user=None):
+    if role not in {"anon", "authenticated"}:
+        raise ValueError("Invalid database request role.")
+    connection.execute(f"SET LOCAL ROLE {role}")
+    if user:
+        connection.execute(
+            "SELECT set_config('request.jwt.claim.sub', %s, true)",
+            (user["id"],),
+        )
+
+
+class LaunchPadHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=str(FRONTEND), **kwargs)
+
+    def send_json(self, status, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as error:
+            raise ValueError("Invalid request body length.") from error
+        if length < 1 or length > 16_384:
+            raise ValueError("Request body must be between 1 and 16384 bytes.")
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ValueError("Request body must contain valid JSON.") from error
+        if not isinstance(payload, dict):
+            raise ValueError("Request body must be a JSON object.")
+        return payload
+
+    def authenticated_user(self):
+        authorization = self.headers.get("Authorization", "")
+        scheme, separator, token = authorization.partition(" ")
+        if not separator or scheme.casefold() != "bearer" or not token.strip():
+            raise PermissionError("Sign in is required for this action.")
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            raise RuntimeError(
+                "Supabase authentication is not configured on the backend."
+            )
+
+        request = Request(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {token.strip()}",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(request, timeout=10) as response:
+                user = json.loads(response.read())
+        except HTTPError as error:
+            if error.code in {401, 403}:
+                raise PermissionError("Your session is invalid or expired. Sign in again.") from error
+            raise RuntimeError("Could not verify the Supabase session.") from error
+        except (URLError, TimeoutError, json.JSONDecodeError) as error:
+            raise RuntimeError("Could not verify the Supabase session.") from error
+
+        if not isinstance(user, dict) or not user.get("id"):
+            raise PermissionError("Your session is invalid. Sign in again.")
+        return user
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/health":
+            if DATABASE_URL:
+                try:
+                    with connect_database() as connection:
+                        connection.execute("SELECT 1")
+                except (RuntimeError, *DATABASE_ERRORS) as error:
+                    logging.error("Health check database failure (%s)", type(error).__name__)
+                    self.send_json(503, {"status": "error", "error": "Database is unavailable."})
+                    return
+            self.send_json(200, {"status": "ok"})
+            return
+        if path == "/api/startups":
+            try:
+                with connect_database() as connection:
+                    if DATABASE_URL:
+                        set_postgres_request_role(connection, "anon")
+                    rows = connection.execute(
+                        "SELECT * FROM startups ORDER BY created_at DESC, id DESC"
+                    ).fetchall()
+                self.send_json(200, [startup_response(row) for row in rows])
+            except RuntimeError as error:
+                logging.error("Could not retrieve startups (%s)", type(error).__name__)
+                self.send_json(500, {"error": "Could not retrieve startups. Check the database configuration."})
+            except DATABASE_ERRORS as error:
+                logging.error("Could not retrieve startups (%s)", type(error).__name__)
+                self.send_json(500, {"error": "Could not retrieve startups."})
+            return
+        if path.startswith("/api/"):
+            self.send_json(404, {"error": "API route not found."})
+            return
+        if path == "/":
+            self.path = "/index.html"
+        super().do_GET()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path not in {"/api/startups", "/api/applications"}:
+            self.send_json(404, {"error": "API route not found."})
+            return
+        try:
+            payload = self.read_json()
+            user = self.authenticated_user() if DATABASE_URL else None
+            if path == "/api/startups":
+                self.create_startup(payload, user)
+            else:
+                self.create_application(payload, user)
+        except PermissionError as error:
+            self.send_json(401, {"error": str(error)})
+        except ValueError as error:
+            self.send_json(400, {"error": str(error)})
+        except RuntimeError as error:
+            logging.error("Request configuration or authentication failed (%s)", type(error).__name__)
+            self.send_json(503, {"error": str(error)})
+        except DATABASE_INTEGRITY_ERRORS:
+            self.send_json(400, {"error": "The submitted data could not be saved."})
+        except DATABASE_ERRORS as error:
+            logging.error("Database request failed (%s)", type(error).__name__)
+            self.send_json(500, {"error": "The server could not save your request."})
+
+    def create_startup(self, payload, user=None):
+        name = required_text(payload, "name", 100)
+        team_name = required_text(payload, "teamName", 100)
+        tagline = required_text(payload, "tagline", 300)
+        looking_for = required_text(payload, "lookingFor", 150)
+        category = payload.get("category")
+        department = payload.get("department")
+        if not isinstance(category, str) or category not in CATEGORIES:
+            raise ValueError("Choose a valid startup category.")
+        if not isinstance(department, str) or department not in DEPARTMENTS:
+            raise ValueError("Choose a valid MRECW department.")
+
+        if DATABASE_URL and not user:
+            raise PermissionError("Sign in is required to publish a startup.")
+
+        user_metadata = user.get("user_metadata") or {} if user else {}
+        founder_name = (
+            required_text(user_metadata, "full_name", 100)
+            if user_metadata.get("full_name")
+            else (user.get("email") or "MRECW Student" if user else "MRECW Student")
+        )
+        founder_major = user_metadata.get("major") or user_metadata.get("department") or "MRECW Student"
+
+        with connect_database() as connection:
+            if DATABASE_URL:
+                set_postgres_request_role(connection, "authenticated", user)
+                row = connection.execute(
+                    """
+                    INSERT INTO startups (
+                        founder_id, name, team_name, tagline, category, department,
+                        looking_for, founder_name, founder_major, founder_avatar,
+                        banner, stage, problem, description
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Prototype',
+                        %s, %s
+                    )
+                    RETURNING *
+                    """,
+                    (
+                        user["id"],
+                        name,
+                        team_name,
+                        tagline,
+                        category,
+                        department,
+                        looking_for,
+                        founder_name,
+                        founder_major,
+                        DEFAULT_AVATAR,
+                        DEFAULT_BANNER,
+                        "Student innovation challenge entry at MRECW.",
+                        "Prototype submitted by an MRECW student team.",
+                    ),
+                ).fetchone()
+            else:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO startups (
+                        name, team_name, tagline, category, department, looking_for,
+                        founder_name, stage, problem, description, banner, founder_major,
+                        founder_avatar
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'Prototype', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        name,
+                        team_name,
+                        tagline,
+                        category,
+                        department,
+                        looking_for,
+                        founder_name,
+                        "Student innovation challenge entry at MRECW.",
+                        "Prototype submitted by an MRECW student team.",
+                        DEFAULT_BANNER,
+                        founder_major,
+                        DEFAULT_AVATAR,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM startups WHERE id = ?", (cursor.lastrowid,)
+                ).fetchone()
+        self.send_json(201, startup_response(row))
+
+    def create_application(self, payload, user=None):
+        startup_id = payload.get("startupId")
+        if not isinstance(startup_id, str):
+            raise ValueError("Choose a startup before applying.")
+        match = re.fullmatch(r"startup-(\d+)", startup_id)
+        if not match:
+            raise ValueError("This startup is not available for applications. Refresh and try again.")
+        numeric_id = int(match.group(1))
+        message = required_text(payload, "message", 1000)
+        if DATABASE_URL:
+            if not user:
+                raise PermissionError("Sign in is required to submit an application.")
+            metadata = user.get("user_metadata") or {}
+            applicant_name = metadata.get("full_name") or user.get("email") or "MRECW Student"
+            email = user.get("email") or ""
+        else:
+            applicant_name = required_text(payload, "applicantName", 100)
+            email = required_text(payload, "email", 254)
+            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                raise ValueError("Enter a valid email address.")
+
+        with connect_database() as connection:
+            if DATABASE_URL:
+                set_postgres_request_role(connection, "authenticated", user)
+                startup = connection.execute(
+                    "SELECT id FROM startups WHERE id = %s", (numeric_id,)
+                ).fetchone()
+            else:
+                startup = connection.execute(
+                    "SELECT id FROM startups WHERE id = ?", (numeric_id,)
+                ).fetchone()
+            if not startup:
+                self.send_json(404, {"error": "That startup could not be found."})
+                return
+            if DATABASE_URL:
+                row = connection.execute(
+                    """
+                    INSERT INTO applications (
+                        startup_id, applicant_id, applicant_name, email, message
+                    ) VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (numeric_id, user["id"], applicant_name, email, message),
+                )
+                application_id = connection.execute(
+                    "SELECT currval('public.applications_id_seq') AS id"
+                ).fetchone()["id"]
+            else:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO applications (startup_id, applicant_name, email, message)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (numeric_id, applicant_name, email, message),
+                )
+                application_id = cursor.lastrowid
+        self.send_json(201, {"id": application_id, "status": "submitted"})
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    initialize_database()
+    server = ThreadingHTTPServer((HOST, PORT), LaunchPadHandler)
+    print(f"LaunchPad MRECW is running at http://{HOST}:{PORT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nLaunchPad server stopped.")
+    finally:
+        server.server_close()
+
+==================== END FILE: backend/server.py ====================
+
+==================== BEGIN FILE: backend/README.md ====================
+# Backend
+
+`server.py` runs the website API. Without `backend/.env` database settings it serves the static frontend with the local SQLite database, preserves existing records, and seeds demo startup teams when they are not already present. With `DATABASE_URL` configured it uses Supabase PostgreSQL, validates the Supabase schema at startup, and verifies Supabase Auth access tokens for write requests.
+
+From the project root:
+
+```powershell
+python backend\server.py
+```
+
+The service listens on `127.0.0.1:8000` by default. `launchpad.db` lives in the project root. Set `HOST` or `PORT` environment variables to override the listener.
+
+## Supabase PostgreSQL mode
+
+1. Apply `supabase/schema.sql` in the Supabase SQL Editor.
+2. From the project root, copy `backend\.env.example` to `backend\.env` and fill in the private PostgreSQL connection string, Supabase Project URL, and public anon/publishable key. Never commit `.env` or expose the database password.
+3. Add the Supabase Project URL and public anon/publishable key to `frontend/js/supabase-config.js` for browser authentication.
+4. Install dependencies from the project root with `python -m pip install -r backend\requirements.txt`.
+5. Run `python backend\server.py`.
+
+The frontend continues calling the same `/api` routes. In PostgreSQL mode, the API validates bearer tokens with Supabase Auth, then executes database requests as the PostgreSQL `anon` or `authenticated` role with the verified user ID set for RLS. If `DATABASE_URL` is absent, SQLite mode remains available for local development.
+
+Do not run with a placeholder or empty PostgreSQL connection string. The API does not automatically apply `schema.sql` or migrate existing SQLite rows.
+
+## Routes
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/health` | Check server readiness |
+| GET | `/api/startups` | Read startup records |
+| POST | `/api/startups` | Validate and persist a startup |
+| POST | `/api/applications` | Validate and persist an application |
+
+SQLite mode is intended for local development and does not provide authentication. Supabase mode verifies signed-in users for write requests. Production hosting still needs HTTPS, secret environment variables, and deployment hardening; the AI Lab remains demo content.
+
+==================== END FILE: backend/README.md ====================
+
+==================== BEGIN FILE: backend/requirements.txt ====================
+psycopg[binary]>=3.2,<4
+python-dotenv>=1.0,<2
+
+==================== END FILE: backend/requirements.txt ====================
+
+==================== BEGIN FILE: backend/.env.example ====================
+DATABASE_URL=PASTE_THE_PRIVATE_POSTGRES_CONNECTION_STRING_HERE
+SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
+SUPABASE_ANON_KEY=YOUR_PUBLIC_ANON_OR_PUBLISHABLE_KEY
+
+==================== END FILE: backend/.env.example ====================
+
+==================== BEGIN FILE: frontend/index.html ====================
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LaunchPad MRECW | Student Startup Marketplace & Innovation Hub</title>
+  <meta name="description" content="Official student startup marketplace and co-founder ecosystem for MRECW (Malla Reddy Engineering College for Women)." />
+
+  <!-- Google Fonts: Plus Jakarta Sans & Inter -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="/css/styles.css" />
+</head>
+<body>
+
+  <header class="navbar">
+    <div class="container nav-container">
+      <div class="brand-wrapper" onclick="switchTab('home')">
+        <div class="brand-icon">🚀</div>
+        <div class="brand-col">
+          <div class="brand-name">
+            LaunchPad MRECW
+            <span class="brand-tag">WOMEN IN TECH</span>
+          </div>
+          <span class="brand-subtext">Malla Reddy Engineering College for Women • Innovation Cell</span>
+        </div>
+      </div>
+
+      <nav class="nav-links-row">
+        <button class="nav-link active" data-tab="home" onclick="switchTab('home')"><span>🚀</span> Startups</button>
+        <button class="nav-link" data-tab="cofounders" onclick="switchTab('cofounders')"><span>🤝</span> Co-Founders</button>
+        <button class="nav-link" data-tab="ailab" onclick="switchTab('ailab')"><span>🤖</span> AI Lab</button>
+        <button class="nav-link" data-tab="mentors" onclick="switchTab('mentors')"><span>🎓</span> Mentors</button>
+      </nav>
+
+      <div class="nav-actions">
+        <button class="btn btn-outline btn-sm" onclick="handleLaunchStartup()">+ Launch Startup</button>
+        <button id="auth-nav-button" class="btn btn-primary btn-sm hidden" onclick="handleAuthButton()">Sign in</button>
+      </div>
+    </div>
+  </header>
+
+  <div id="view-home" class="app-view-panel">
+    <section class="hero-section">
+      <canvas id="aurora-canvas"></canvas>
+      <div class="container hero-content">
+        <div class="hero-badge-pill">✨ MRECW Innovation & Incubation Center (IIC)</div>
+        <h1 class="hero-title">
+          Where <span class="hero-title-gradient">MRECW Women Innovators</span> Launch, Collaborate & Scale
+        </h1>
+        <p class="hero-subtitle">
+          The dedicated student venture marketplace for <strong>Malla Reddy Engineering College for Women</strong>. Showcase student ideas, find cross-department co-founders, and build real-world prototypes.
+        </p>
+
+        <div class="hero-stats-row">
+          <div class="hero-stat"><span class="stat-value" style="color: var(--primary-blue);">45+</span><span class="stat-label">Active Student Teams</span></div>
+          <div class="hero-stat"><span class="stat-value" style="color: var(--accent-cyan);">280+</span><span class="stat-label">MRECW Co-Founders</span></div>
+          <div class="hero-stat"><span class="stat-value" style="color: var(--secondary-violet);">₹18.5L+</span><span class="stat-label">Grants & Hackathon Wins</span></div>
+          <div class="hero-stat"><span class="stat-value" style="color: #f472b6;">6 Branches</span><span class="stat-label">Cross-Dept Synergy</span></div>
+        </div>
+
+        <div class="campus-ticker-strip">
+          <span class="ticker-label">MRECW Engineering Departments</span>
+          <div class="ticker-badges-row">
+            <span class="ticker-pill">CSE (Computer Science)</span>
+            <span class="ticker-pill">CSE - AI & ML</span>
+            <span class="ticker-pill">CSE - Data Science</span>
+            <span class="ticker-pill">IT (Information Technology)</span>
+            <span class="ticker-pill">ECE (Electronics & Comm)</span>
+            <span class="ticker-pill">EEE (Electrical & Electronics)</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <main class="container" style="padding-top: 2rem;">
+      <div class="spotlight-banner">
+        <div>
+          <span class="spotlight-badge">🏆 Startup of the Week</span>
+          <h2 class="spotlight-title">AgroVision AI — Team AgroSense (MRECW - CSE AI&ML)</h2>
+          <p class="spotlight-desc">
+            Autonomous on-device crop blight diagnosis tool helping smallholder farmers identify plant diseases in 300ms without internet. Developed by 3rd-year MRECW students.
+          </p>
+          <div style="margin-top: 1rem; display: flex; gap: 0.5rem;">
+            <button class="btn btn-primary btn-sm" onclick="openFeaturedPitch()">Read Pitch Deck ➔</button>
+            <button class="btn btn-outline btn-sm" onclick="openFeaturedJoinTeam()">Apply as AI Developer</button>
+          </div>
+        </div>
+        <img src="https://images.unsplash.com/photo-1625246333195-78d9c38ad449?w=360&auto=format&fit=crop&q=80" style="width: 240px; height: 135px; object-fit: cover; border-radius: 14px;" />
+      </div>
+
+      <div class="section-header-row">
+        <div>
+          <h2 class="section-title">Explore MRECW Student Ventures</h2>
+          <p class="section-desc">Browse student ventures across 8 technical domains built by student teams at MRECW.</p>
+        </div>
+        <div class="filter-controls-group">
+          <div class="search-input-box">
+            <span class="search-icon-pos">🔍</span>
+            <input type="text" placeholder="Search startups, teams, or skills..." oninput="handleMarketplaceSearch(this.value)" />
+          </div>
+          <select class="form-select" style="width: auto;" onchange="handleMarketplaceCampus(this.value)">
+            <option value="all">🏢 All MRECW Departments</option>
+            <option value="CSE">CSE (Computer Science)</option>
+            <option value="AI & ML">CSE - AI & ML</option>
+            <option value="Data Science">CSE - Data Science</option>
+            <option value="IT">IT (Information Technology)</option>
+            <option value="ECE">ECE (Electronics & Comm)</option>
+            <option value="EEE">EEE (Electrical & Electronics)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="category-scroll-strip">
+        <button class="cat-chip active" data-category-filter onclick="handleCategoryFilter('all', this)">All Categories</button>
+        <button class="cat-chip" id="saved-filter" aria-pressed="false" onclick="toggleSavedFilter(this)">❤️ Saved</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('ai', this)">🤖 Artificial Intelligence</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('agritech', this)">🌱 Agriculture Tech</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('edtech', this)">📚 Education Tech</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('healthtech', this)">🩺 Healthcare</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('fintech', this)">💳 Financial Tech</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('sustainability', this)">🌍 Sustainability</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('ecommerce', this)">📦 E-Commerce</button>
+        <button class="cat-chip" data-category-filter onclick="handleCategoryFilter('robotics', this)">🦾 Robotics</button>
+      </div>
+
+      <div class="startups-grid" id="marketplace-grid"></div>
+
+      <!-- Department Leaderboard -->
+      <div style="background: var(--bg-card); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: 1.75rem; margin-bottom: 3.5rem;">
+        <h3 style="font-size: 1.3rem; font-weight: 800; color: #fff; margin-bottom: 0.25rem;">🏫 MRECW Department Startup Leaderboard</h3>
+        <p style="font-size: 0.825rem; color: var(--text-muted); margin-bottom: 1.25rem;">Ranking MRECW engineering departments by student startup traction and hackathon grants.</p>
+        <div style="overflow-x: auto;">
+          <table style="width: 100%; text-align: left; border-collapse: collapse;">
+            <thead>
+              <tr style="border-bottom: 1px solid var(--border-subtle); font-size: 0.75rem; color: var(--text-dim); text-transform: uppercase;">
+                <th style="padding: 0.6rem 1rem;">Rank</th>
+                <th style="padding: 0.6rem 1rem;">MRECW Department</th>
+                <th style="padding: 0.6rem 1rem;">Active Startups</th>
+                <th style="padding: 0.6rem 1rem;">Teams Formed</th>
+                <th style="padding: 0.6rem 1rem;">Grants Won</th>
+              </tr>
+            </thead>
+            <tbody id="leaderboard-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div id="view-cofounders" class="app-view-panel hidden container" style="padding-top: 3rem;">
+    <h2 class="section-title">MRECW Co-Founders & Talent Hub</h2>
+    <p class="section-desc" style="margin-bottom: 1.5rem;">Find passionate peer engineers and designers across MRECW departments.</p>
+    <div class="cofounders-grid" id="cofounders-grid"></div>
+  </div>
+
+  <div id="view-ailab" class="app-view-panel hidden container" style="padding-top: 3rem;">
+    <div id="ailab-container"></div>
+  </div>
+
+  <div id="view-mentors" class="app-view-panel hidden container" style="padding-top: 3rem;">
+    <h2 class="section-title">MRECW Mentors & Advisory Council</h2>
+    <p class="section-desc" style="margin-bottom: 1.5rem;">Book 1-on-1 sessions with IIC faculty leads and distinguished alumnae.</p>
+    <div class="cofounders-grid" id="mentors-grid"></div>
+  </div>
+
+  <!-- Modals -->
+  <div class="modal-overlay hidden" id="modal-post-startup">
+    <div class="modal-card">
+      <h3 style="font-size: 1.25rem; font-weight: 800; color: #fff; margin-bottom: 1rem;">🚀 Launch Your Startup (MRECW)</h3>
+      <form onsubmit="handlePostStartup(event)">
+        <div class="form-row">
+          <div class="form-group"><label>Startup Name *</label><input type="text" id="post-name" class="form-input" maxlength="100" placeholder="e.g. SheShield IoT" required /></div>
+          <div class="form-group"><label>Team Name *</label><input type="text" id="post-team" class="form-input" maxlength="100" placeholder="e.g. Team CyberNari" required /></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><label>Category *</label><select id="post-category" class="form-select"><option value="ai">AI</option><option value="agritech" selected>Agriculture Tech</option><option value="edtech">Education Tech</option><option value="healthtech">Healthcare</option><option value="fintech">FinTech</option><option value="sustainability">Sustainability</option><option value="ecommerce">E-Commerce</option><option value="robotics">Robotics</option></select></div>
+          <div class="form-group"><label>MRECW Department *</label><select id="post-university" class="form-select"><option value="CSE - AI & ML">CSE - AI & ML</option><option value="CSE">CSE</option><option value="Data Science">Data Science</option><option value="IT">IT</option><option value="ECE">ECE</option><option value="EEE">EEE</option></select></div>
+        </div>
+        <div class="form-group"><label>Tagline / Elevator Pitch *</label><input type="text" id="post-tagline" class="form-input" maxlength="300" placeholder="One line description..." required /></div>
+        <div class="form-group"><label>Role Needed in Team *</label><input type="text" id="post-looking-for" class="form-input" maxlength="150" placeholder="e.g. Python Developer / IoT Specialist" required /></div>
+        <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1rem;">
+          <button type="button" class="btn btn-outline" onclick="closeModal('modal-post-startup')">Cancel</button>
+          <button type="submit" class="btn btn-primary">Publish Venture</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="modal-overlay hidden" id="modal-startup-detail">
+    <div class="modal-card"><div id="modal-detail-body"></div></div>
+  </div>
+
+  <div class="modal-overlay hidden" id="modal-join-team">
+    <div class="modal-card">
+      <h3 style="font-size: 1.25rem; font-weight: 800; color: #fff; margin-bottom: 0.5rem;">🤝 Apply to Join Team</h3>
+      <p style="font-size: 0.85rem; color: #94a3b8; margin-bottom: 1rem;">Connect directly with the MRECW student founder.</p>
+      <form onsubmit="handleJoinApplication(event)">
+        <div class="form-group"><label for="applicant-name">Your Name *</label><input type="text" id="applicant-name" class="form-input" maxlength="100" required /></div>
+        <div class="form-group"><label for="applicant-email">MRECW Email *</label><input type="email" id="applicant-email" class="form-input" maxlength="254" required /></div>
+        <div class="form-group"><label for="application-message">Why do you want to join? *</label><textarea id="application-message" class="form-input" maxlength="1000" style="min-height: 80px;" required></textarea></div>
+        <div style="display: flex; justify-content: flex-end; gap: 0.5rem;"><button type="button" class="btn btn-outline" onclick="closeModal('modal-join-team')">Cancel</button><button type="submit" class="btn btn-primary">Send Application</button></div>
+      </form>
+    </div>
+  </div>
+
+  <div class="modal-overlay hidden" id="modal-auth">
+    <div class="modal-card">
+      <h3 style="font-size: 1.25rem; font-weight: 800; color: #fff; margin-bottom: 0.5rem;">🔐 MRECW account</h3>
+      <p class="section-desc" style="margin-bottom: 1rem;">Sign in to publish startups or apply to join a team.</p>
+      <form onsubmit="handleAuthSubmit(event)">
+        <div class="form-group">
+          <label for="auth-mode">Account action</label>
+          <select id="auth-mode" class="form-select" onchange="updateAuthFields()">
+            <option value="signin">Sign in</option>
+            <option value="signup">Create account</option>
+          </select>
+        </div>
+        <div id="auth-signup-fields" class="hidden">
+          <div class="form-group">
+            <label for="auth-name">Your name *</label>
+            <input id="auth-name" class="form-input" type="text" maxlength="100" autocomplete="name" />
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="auth-department">Department *</label>
+              <select id="auth-department" class="form-select">
+                <option value="CSE - AI & ML">CSE - AI & ML</option>
+                <option value="CSE">CSE</option>
+                <option value="Data Science">Data Science</option>
+                <option value="IT">IT</option>
+                <option value="ECE">ECE</option>
+                <option value="EEE">EEE</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="auth-major">Course / year</label>
+              <input id="auth-major" class="form-input" type="text" maxlength="100" placeholder="CSE '27" />
+            </div>
+          </div>
+        </div>
+        <div class="form-group">
+          <label for="auth-email">Email *</label>
+          <input id="auth-email" class="form-input" type="email" maxlength="254" autocomplete="email" required />
+        </div>
+        <div class="form-group">
+          <label for="auth-password">Password *</label>
+          <input id="auth-password" class="form-input" type="password" minlength="8" autocomplete="current-password" required />
+        </div>
+        <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
+          <button type="button" class="btn btn-outline" onclick="closeModal('modal-auth')">Cancel</button>
+          <button id="auth-submit" type="submit" class="btn btn-primary">Sign in</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.1/dist/umd/supabase.min.js" defer></script>
+  <script src="/js/supabase-config.js" defer></script>
+  <script src="/js/app.js" defer></script>
+</body>
+</html>
+==================== END FILE: frontend/index.html ====================
+
+==================== BEGIN FILE: frontend/README.md ====================
+# Frontend
+
+The frontend is a static, responsive LaunchPad MRECW site:
+
+- `index.html` contains the page structure and dialogs.
+- `css/styles.css` contains the supplied visual design.
+- `js/app.js` handles navigation, filtering, rendering, API requests, and saved startups.
+
+Serve it through the backend with `python backend\server.py` from the project root. The JavaScript uses same-origin `/api` endpoints in local mode, so opening `index.html` directly as a local file will not enable publishing or applications.
+
+Startup bookmarks are saved in the current browser using local storage and can be filtered with the **Saved** chip. They are browser-specific and are not synced between devices or accounts.
+
+To enable Supabase mode, run `supabase/schema.sql` in your Supabase project's SQL Editor and set the project URL and public anon/publishable key in `js/supabase-config.js`. The browser uses Supabase Auth; startup and application data requests go through the Python API, which verifies access tokens and applies PostgreSQL roles so database RLS policies are enforced. Leave the Supabase settings blank to use local SQLite. Never use a Supabase service-role/secret key in the frontend.
+
+The frontend and Python API must be served from the same origin because API requests use relative `/api` paths. GitHub Pages alone cannot host the Python API. See the root README and `supabase/README.md` for deployment and configuration details.
+
+==================== END FILE: frontend/README.md ====================
+
+==================== BEGIN FILE: frontend/css/styles.css ====================
+:root {
+      --bg-navy: #080b1a;
+      --bg-surface: #0f1429;
+      --bg-card: #151b32;
+      --bg-card-hover: #1c2442;
+
+      --primary-blue: #3b82f6;
+      --secondary-violet: #8b5cf6;
+      --accent-cyan: #22d3ee;
+      --accent-pink: #ec4899;
+      --accent-amber: #f59e0b;
+      --accent-emerald: #10b981;
+
+      --text-white: #ffffff;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-hover: rgba(99, 102, 241, 0.4);
+
+      --radius-sm: 8px;
+      --radius-md: 14px;
+      --radius-lg: 20px;
+      --radius-full: 9999px;
+
+      --font-family: 'Plus Jakarta Sans', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      --transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: var(--font-family);
+      background-color: var(--bg-navy);
+      color: var(--text-white);
+      line-height: 1.6;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: '';
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background-image: 
+        radial-gradient(circle at 15% 15%, rgba(139, 92, 246, 0.18) 0%, transparent 45%),
+        radial-gradient(circle at 85% 20%, rgba(59, 130, 246, 0.16) 0%, transparent 45%),
+        radial-gradient(circle at 50% 80%, rgba(34, 211, 238, 0.08) 0%, transparent 50%),
+        radial-gradient(circle at 90% 75%, rgba(236, 72, 153, 0.07) 0%, transparent 45%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 0 1.5rem;
+      position: relative;
+      z-index: 1;
+    }
+
+    .navbar {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(8, 11, 26, 0.88);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border-subtle);
+      padding: 0.85rem 0;
+    }
+
+    .nav-container {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1.25rem;
+    }
+
+    .brand-wrapper {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .brand-icon {
+      width: 42px;
+      height: 42px;
+      border-radius: var(--radius-md);
+      background: linear-gradient(135deg, var(--primary-blue), var(--secondary-violet));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.3rem;
+      color: #fff;
+      box-shadow: 0 0 20px rgba(59, 130, 246, 0.4);
+    }
+
+    .brand-col {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .brand-name {
+      font-size: 1.25rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      background: linear-gradient(135deg, #ffffff 40%, #cbd5e1 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .brand-tag {
+      font-size: 0.65rem;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 4px;
+      background: rgba(236, 72, 153, 0.2);
+      color: #f472b6;
+      border: 1px solid rgba(236, 72, 153, 0.35);
+    }
+
+    .brand-subtext {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    .nav-links-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      list-style: none;
+    }
+
+    .nav-link {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.55rem 0.95rem;
+      border-radius: var(--radius-full);
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-decoration: none;
+      cursor: pointer;
+      transition: var(--transition);
+      border: 1px solid transparent;
+      background: transparent;
+    }
+
+    .nav-link:hover {
+      color: var(--text-white);
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .nav-link.active {
+      color: #fff;
+      background: rgba(59, 130, 246, 0.15);
+      border-color: rgba(59, 130, 246, 0.4);
+    }
+
+    .nav-actions {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      font-family: inherit;
+      font-size: 0.875rem;
+      font-weight: 600;
+      padding: 0.55rem 1.15rem;
+      border-radius: var(--radius-full);
+      cursor: pointer;
+      transition: var(--transition);
+      text-decoration: none;
+      border: none;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--primary-blue), var(--secondary-violet));
+      color: #ffffff;
+      box-shadow: 0 4px 15px rgba(59, 130, 246, 0.3);
+    }
+
+    .btn-primary:hover {
+      box-shadow: 0 6px 22px rgba(139, 92, 246, 0.45);
+      transform: translateY(-1px);
+    }
+
+    .btn-outline {
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text-white);
+      border: 1px solid var(--border-subtle);
+    }
+
+    .btn-outline:hover {
+      background: rgba(255, 255, 255, 0.08);
+      border-color: var(--border-hover);
+    }
+
+    .btn-sm { padding: 0.4rem 0.85rem; font-size: 0.8rem; }
+    .btn-ghost { background: transparent; color: var(--text-muted); border: none; }
+    .btn-ghost:hover { color: #fff; }
+
+    .user-pill-btn {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      padding: 0.35rem 0.85rem 0.35rem 0.45rem;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-full);
+      cursor: pointer;
+      transition: var(--transition);
+    }
+
+    .user-avatar-small {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      object-fit: cover;
+    }
+
+    .hero-section {
+      position: relative;
+      padding: 3.5rem 0 2.5rem;
+      text-align: center;
+      overflow: hidden;
+    }
+
+    #aurora-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 0;
+      opacity: 0.65;
+    }
+
+    .hero-content {
+      position: relative;
+      z-index: 1;
+      max-width: 920px;
+      margin: 0 auto;
+    }
+
+    .hero-badge-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.35rem 1rem;
+      border-radius: var(--radius-full);
+      background: rgba(236, 72, 153, 0.12);
+      border: 1px solid rgba(236, 72, 153, 0.3);
+      color: #f472b6;
+      font-size: 0.8rem;
+      font-weight: 700;
+      margin-bottom: 1.25rem;
+      backdrop-filter: blur(8px);
+    }
+
+    .hero-title {
+      font-size: clamp(2.2rem, 5vw, 3.8rem);
+      font-weight: 800;
+      line-height: 1.15;
+      letter-spacing: -0.03em;
+      margin-bottom: 1.25rem;
+    }
+
+    .hero-title-gradient {
+      background: linear-gradient(135deg, #60a5fa 0%, #c084fc 50%, #f472b6 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .hero-subtitle {
+      font-size: 1.05rem;
+      color: var(--text-muted);
+      max-width: 720px;
+      margin: 0 auto 2rem;
+      line-height: 1.6;
+    }
+
+    .hero-cta-group {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 1rem;
+      flex-wrap: wrap;
+      margin-bottom: 2.5rem;
+    }
+
+    .hero-stats-row {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 2.5rem;
+      flex-wrap: wrap;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--border-subtle);
+      max-width: 800px;
+      margin: 0 auto;
+    }
+
+    .hero-stat {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .stat-value {
+      font-size: 1.6rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+
+    .stat-label {
+      font-size: 0.775rem;
+      color: var(--text-dim);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .campus-ticker-strip {
+      margin-top: 2rem;
+      padding: 0.85rem 1.25rem;
+      background: rgba(15, 20, 41, 0.7);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-full);
+      display: inline-flex;
+      align-items: center;
+      gap: 1rem;
+      backdrop-filter: blur(12px);
+      max-width: 100%;
+      overflow-x: auto;
+    }
+
+    .ticker-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      color: #f472b6;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      white-space: nowrap;
+    }
+
+    .ticker-badges-row {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+      white-space: nowrap;
+    }
+
+    .ticker-pill {
+      font-size: 0.75rem;
+      padding: 0.25rem 0.65rem;
+      border-radius: var(--radius-full);
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      color: #cbd5e1;
+    }
+
+    .section-header-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      flex-wrap: wrap;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .section-title { font-size: 1.75rem; font-weight: 800; letter-spacing: -0.02em; }
+    .section-desc { font-size: 0.875rem; color: var(--text-muted); margin-top: 0.25rem; }
+
+    .filter-controls-group {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+
+    .search-input-box {
+      position: relative;
+      min-width: 260px;
+    }
+
+    .search-input-box input {
+      width: 100%;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-full);
+      padding: 0.5rem 1rem 0.5rem 2.25rem;
+      color: #fff;
+      font-family: inherit;
+      font-size: 0.85rem;
+      outline: none;
+      transition: var(--transition);
+    }
+
+    .search-icon-pos {
+      position: absolute;
+      left: 0.85rem;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--text-dim);
+      font-size: 0.85rem;
+      pointer-events: none;
+    }
+
+    .category-scroll-strip {
+      display: flex;
+      gap: 0.5rem;
+      overflow-x: auto;
+      padding-bottom: 0.75rem;
+      margin-bottom: 2rem;
+    }
+
+    .cat-chip {
+      padding: 0.45rem 1rem;
+      border-radius: var(--radius-full);
+      font-size: 0.8rem;
+      font-weight: 600;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-muted);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: var(--transition);
+    }
+
+    .cat-chip.active {
+      background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(139, 92, 246, 0.2));
+      border-color: var(--primary-blue);
+      color: #fff;
+      font-weight: 700;
+    }
+
+    .startups-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      gap: 1.5rem;
+      margin-bottom: 3.5rem;
+    }
+
+    .startup-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      transition: var(--transition);
+    }
+
+    .startup-card:hover {
+      transform: translateY(-4px);
+      border-color: var(--border-hover);
+      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.4), 0 0 25px rgba(139, 92, 246, 0.15);
+    }
+
+    .card-top-cover {
+      height: 140px;
+      position: relative;
+      background-size: cover;
+      background-position: center;
+    }
+
+    .card-top-cover::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, rgba(8, 11, 26, 0.2) 0%, rgba(21, 27, 50, 0.95) 100%);
+    }
+
+    .category-tag-chip {
+      position: absolute;
+      top: 0.85rem;
+      left: 0.85rem;
+      z-index: 2;
+      background: rgba(8, 11, 26, 0.75);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      backdrop-filter: blur(6px);
+      padding: 0.25rem 0.65rem;
+      border-radius: var(--radius-full);
+      font-size: 0.7rem;
+      font-weight: 700;
+      color: var(--accent-cyan);
+    }
+
+    .stage-pill {
+      position: absolute;
+      top: 0.85rem;
+      right: 0.85rem;
+      z-index: 2;
+      padding: 0.2rem 0.6rem;
+      border-radius: var(--radius-full);
+      font-size: 0.68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .stage-idea { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.4); }
+    .stage-prototype { background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4); }
+    .stage-mvp { background: rgba(139, 92, 246, 0.2); color: #c084fc; border: 1px solid rgba(139, 92, 246, 0.4); }
+    .stage-testing { background: rgba(34, 211, 238, 0.2); color: #22d3ee; border: 1px solid rgba(34, 211, 238, 0.4); }
+    .stage-launch { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); }
+
+    .card-main-content {
+      padding: 1.25rem;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .card-founder-strip {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .card-founder-img {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      object-fit: cover;
+      border: 1.5px solid var(--primary-blue);
+    }
+
+    .founder-title-col { display: flex; flex-direction: column; }
+    .founder-name-str { font-size: 0.8rem; font-weight: 700; color: #cbd5e1; }
+    .campus-verify-pill { font-size: 0.65rem; color: #34d399; font-weight: 700; }
+    .founder-sub-str { font-size: 0.7rem; color: var(--text-dim); }
+
+    .team-badge-tag {
+      font-size: 0.68rem;
+      font-weight: 700;
+      color: #c084fc;
+      background: rgba(139, 92, 246, 0.15);
+      border: 1px solid rgba(139, 92, 246, 0.3);
+      padding: 1px 6px;
+      border-radius: 4px;
+      display: inline-block;
+      margin-bottom: 0.4rem;
+      width: fit-content;
+    }
+
+    .card-venture-title { font-size: 1.15rem; font-weight: 800; color: #fff; margin-bottom: 0.35rem; }
+    .card-venture-tagline { font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem; flex: 1; }
+
+    .card-role-box {
+      background: rgba(8, 11, 26, 0.5);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 0.6rem 0.85rem;
+      margin-bottom: 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 0.75rem;
+    }
+
+    .role-label { color: var(--text-dim); font-weight: 600; }
+    .role-val { color: var(--accent-cyan); font-weight: 700; }
+
+    .card-bottom-actions {
+      padding: 0.85rem 1.25rem;
+      background: rgba(15, 20, 41, 0.5);
+      border-top: 1px solid var(--border-subtle);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .btn-save-toggle {
+      width: 38px;
+      height: 38px;
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 50%;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 1.35rem;
+      transition: var(--transition);
+    }
+
+    .btn-save-toggle:hover,
+    .btn-save-toggle:focus-visible {
+      color: #f472b6;
+      background: rgba(236, 72, 153, 0.1);
+      border-color: rgba(236, 72, 153, 0.3);
+      outline: none;
+    }
+
+    .btn-save-toggle.is-saved { color: #f472b6; }
+
+    .spotlight-banner {
+      background: linear-gradient(135deg, rgba(21, 27, 50, 0.8) 0%, rgba(30, 41, 74, 0.6) 100%);
+      border: 1px solid rgba(139, 92, 246, 0.35);
+      border-radius: var(--radius-lg);
+      padding: 1.75rem;
+      margin-bottom: 2.5rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1.5rem;
+    }
+
+    .spotlight-badge { font-size: 0.75rem; font-weight: 800; color: #fbbf24; text-transform: uppercase; }
+    .spotlight-title { font-size: 1.45rem; font-weight: 800; color: #fff; margin: 0.3rem 0; }
+    .spotlight-desc { font-size: 0.875rem; color: var(--text-muted); max-width: 650px; }
+
+    .cofounders-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 1.5rem;
+      margin-bottom: 3.5rem;
+    }
+
+    .cofounder-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .cofounder-avatar {
+      width: 56px;
+      height: 56px;
+      border-radius: 50%;
+      object-fit: cover;
+      border: 2px solid var(--primary-blue);
+    }
+
+    .skill-pill {
+      font-size: 0.7rem;
+      padding: 0.2rem 0.55rem;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: #cbd5e1;
+    }
+
+    .ai-lab-container {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 2.25rem;
+      margin-bottom: 3.5rem;
+    }
+
+    .ai-prompt-box {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 0.85rem 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .ai-prompt-box input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: #fff;
+      font-family: inherit;
+      font-size: 0.95rem;
+      outline: none;
+    }
+
+    .prompt-presets-row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 2rem; }
+    .prompt-preset-btn {
+      font-size: 0.75rem;
+      padding: 0.35rem 0.75rem;
+      border-radius: var(--radius-full);
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-muted);
+      cursor: pointer;
+    }
+
+    .ai-result-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 1rem;
+    }
+
+    .ai-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 1.25rem;
+    }
+
+    .ai-card-title { font-size: 0.8rem; font-weight: 700; color: #38bdf8; text-transform: uppercase; margin-bottom: 0.4rem; }
+    .ai-card-body { font-size: 0.85rem; color: #cbd5e1; line-height: 1.5; }
+
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.75);
+      backdrop-filter: blur(8px);
+      z-index: 200;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+    }
+
+    .modal-overlay.hidden { display: none !important; }
+
+    .modal-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-hover);
+      border-radius: var(--radius-lg);
+      width: 100%;
+      max-width: 580px;
+      max-height: 90vh;
+      overflow-y: auto;
+      padding: 1.5rem;
+      position: relative;
+    }
+
+    .form-group { margin-bottom: 1.15rem; }
+    .form-group label { display: block; font-size: 0.8rem; font-weight: 600; color: #cbd5e1; margin-bottom: 0.4rem; }
+    .form-input, .form-select, .form-textarea {
+      width: 100%;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 0.65rem 0.9rem;
+      color: #fff;
+      font-family: inherit;
+      font-size: 0.875rem;
+      outline: none;
+    }
+    .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+
+    .toast-container {
+      position: fixed;
+      bottom: 2rem;
+      right: 2rem;
+      z-index: 300;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .toast-item {
+      background: rgba(15, 20, 41, 0.95);
+      border: 1px solid var(--primary-blue);
+      backdrop-filter: blur(12px);
+      color: #fff;
+      padding: 0.75rem 1.25rem;
+      border-radius: var(--radius-md);
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+
+    .hidden { display: none !important; }
+
+    .category-scroll-strip {
+      scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
+      scrollbar-width: thin;
+    }
+
+    .category-scroll-strip::-webkit-scrollbar { height: 6px; }
+    .category-scroll-strip::-webkit-scrollbar-track { background: transparent; }
+    .category-scroll-strip::-webkit-scrollbar-thumb {
+      background: rgba(148, 163, 184, 0.35);
+      border-radius: var(--radius-full);
+    }
+
+    @media (max-width: 1100px) {
+      .nav-container { flex-wrap: wrap; gap: 0.75rem; }
+      .brand-name { font-size: 1.05rem; }
+      .brand-subtext { display: none; }
+      .nav-links-row {
+        order: 3;
+        width: 100%;
+        justify-content: center;
+        flex-wrap: wrap;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .container { padding: 0 1rem; }
+      .navbar { padding: 0.65rem 0; }
+      .nav-container { gap: 0.55rem; }
+      .brand-wrapper { gap: 0.5rem; }
+      .brand-icon { width: 36px; height: 36px; font-size: 1.1rem; }
+      .brand-name { font-size: 0.95rem; gap: 4px; }
+      .brand-tag { font-size: 0.5rem; padding: 2px 4px; }
+      .nav-actions { gap: 0.4rem; }
+      .nav-actions .btn { padding: 0.45rem 0.7rem; font-size: 0.72rem; }
+      .user-pill-btn span { display: none; }
+      .nav-links-row {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0.3rem;
+      }
+      .nav-link { justify-content: center; padding: 0.45rem 0.35rem; font-size: 0.75rem; }
+      .hero-title { font-size: clamp(2rem, 10vw, 3.2rem); }
+      .hero-stats-row { gap: 1rem; }
+      .spotlight-banner { align-items: flex-start; flex-direction: column; }
+      .spotlight-banner img { width: 100% !important; height: 180px !important; }
+      .section-header-row { align-items: stretch; }
+      .filter-controls-group { width: 100%; }
+      .search-input-box { min-width: 0; flex: 1; }
+      .filter-controls-group .form-select { max-width: 100%; }
+      .startups-grid, .cofounders-grid { grid-template-columns: minmax(0, 1fr); }
+      .form-row { grid-template-columns: 1fr; gap: 0; }
+      .toast-container { left: 1rem; right: 1rem; bottom: 1rem; }
+    }
+
+==================== END FILE: frontend/css/styles.css ====================
+
+==================== BEGIN FILE: frontend/js/app.js ====================
+const appState = {
+      activeTab: 'home',
+      activeCategory: 'all',
+      activeCampus: 'all',
+      searchQuery: '',
+      showSavedOnly: false,
+      selectedStartupId: null,
+      savedIds: new Set(),
+      supabaseClient: null,
+      authUser: null,
+      authSession: null,
+      pendingAuthAction: null,
+      startups: [
+        {
+          id: "startup-mrecw-1",
+          name: "AgroVision AI",
+          teamName: "Team AgroSense",
+          tagline: "AI-powered crop disease detection & yield forecasting for smallholder farmers",
+          category: "agritech",
+          stage: "Prototype",
+          university: "CSE - AI & ML",
+          founder: { name: "Keerthi Reddy", major: "CSE - AI & ML '26", avatar: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80" },
+          banner: "https://images.unsplash.com/photo-1625246333195-78d9c38ad449?w=600&auto=format&fit=crop&q=80",
+          lookingFor: "Python / PyTorch AI Engineer",
+          problem: "Over ₹25,000 crores lost annually in rural Telangana farming communities due to delayed crop blight diagnosis and inaccessible agronomists.",
+          description: "Edge-based neural network model deployed on a mobile app diagnosing plant stress in under 300ms without internet."
+        },
+        {
+          id: "startup-mrecw-2",
+          name: "SheShield IoT",
+          teamName: "Team CyberNari",
+          tagline: "Smart wearable pendant and discrete emergency SOS beacon for women's campus & transit safety",
+          category: "ai",
+          stage: "Prototype",
+          university: "IT",
+          founder: { name: "Bhavana Varma", major: "Information Tech '25", avatar: "https://images.unsplash.com/photo-1517841905240-472988babdf9?w=100&auto=format&fit=crop&q=80" },
+          banner: "https://images.unsplash.com/photo-1518770660439-4636190af475?w=600&auto=format&fit=crop&q=80",
+          lookingFor: "Embedded IoT / Firmware Engineer",
+          problem: "Delayed emergency response and vulnerable night transit around suburban campus zones.",
+          description: "Discreet jewelry-integrated trigger device with real-time GPS triangulation, automatic dual-mic audio recording, and campus security dispatch."
+        },
+        {
+          id: "startup-mrecw-3",
+          name: "ExamGenie AI",
+          teamName: "Team CodeCrafters",
+          tagline: "Automated autonomous syllabus question bank & active recall test generator",
+          category: "edtech",
+          stage: "MVP",
+          university: "CSE",
+          founder: { name: "Sravani Rao", major: "CSE '26", avatar: "https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=100&auto=format&fit=crop&q=80" },
+          banner: "https://images.unsplash.com/photo-1516321318423-f06f85e504b3?w=600&auto=format&fit=crop&q=80",
+          lookingFor: "Full-Stack React Developer",
+          problem: "Engineering students spend 15+ hours manually finding past question papers, syllabus mappings, and solution keys before mid-terms.",
+          description: "AI engine that parses course syllabi and past 5 years of exam papers to generate targeted mock papers with rubric answers."
+        },
+        {
+          id: "startup-mrecw-4",
+          name: "PulseGuard Bio",
+          teamName: "Team BioInnovators",
+          tagline: "Non-invasive wearable health & heat stress sensor for lab and outdoor safety",
+          category: "healthtech",
+          stage: "Testing",
+          university: "ECE",
+          founder: { name: "Divya Nallamothu", major: "ECE '26", avatar: "https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=100&auto=format&fit=crop&q=80" },
+          banner: "https://images.unsplash.com/photo-1576091160550-2173dba999ef?w=600&auto=format&fit=crop&q=80",
+          lookingFor: "Mobile App Developer (Flutter)",
+          problem: "Heat exhaustion and sudden vitals fluctuations in industrial sports and outdoor lab environments go undetected.",
+          description: "Skin-contact photoplethysmography sensor transmitting biometric patterns to real-time guardian dashboards via BLE."
+        },
+        {
+          id: "startup-mrecw-5",
+          name: "CampusSplit Pay",
+          teamName: "Team FinSpire",
+          tagline: "Smart hostel roommate expense manager with micro-savings & UPI split ledger",
+          category: "fintech",
+          stage: "Launch",
+          university: "Data Science",
+          founder: { name: "Ananya Sharma", major: "CSE - Data Science '27", avatar: "https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=100&auto=format&fit=crop&q=80" },
+          banner: "https://images.unsplash.com/photo-1559526324-4b87b5e36e44?w=600&auto=format&fit=crop&q=80",
+          lookingFor: "UI/UX & Graphic Designer",
+          problem: "Hostel and day-scholar students struggle with messy manual calculations for mess bills and project supplies.",
+          description: "Instant group UPI payment tracker with automated WhatsApp settlement reminders."
+        },
+        {
+          id: "startup-mrecw-6",
+          name: "EcoDorm Cycle",
+          teamName: "Team EcoWarriors",
+          tagline: "Hostel cafeteria surplus food redistribution & student pre-loved exchange",
+          category: "sustainability",
+          stage: "Prototype",
+          university: "EEE",
+          founder: { name: "Pooja Kulkarni", major: "EEE '26", avatar: "https://images.unsplash.com/photo-1524504388940-b1c1722653e1?w=100&auto=format&fit=crop&q=80" },
+          banner: "https://images.unsplash.com/photo-1504674900247-0877df9cc836?w=600&auto=format&fit=crop&q=80",
+          lookingFor: "Backend Developer (Node.js/Python)",
+          problem: "Daily campus mess food surplus goes unutilized while students need affordable food solutions.",
+          description: "Campus-exclusive verified peer marketplace reducing dining hall waste."
+        }
+      ],
+      coFounders: [
+        { name: "Keerthi Reddy", branch: "CSE - AI & ML ('26)", role: "Full-Stack & Deep Learning Developer", skills: ["Python", "PyTorch", "React", "OpenCV"], bio: "Lead developer in MRECW Innovation Club. Built computer vision models for agriculture hackathons.", avatar: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80" },
+        { name: "Bhavana Varma", branch: "Information Technology ('25)", role: "IoT & Cybersecurity Specialist", skills: ["Arduino / ESP32", "Embedded C", "Node.js"], bio: "Winner of Smart India Hackathon internal round. Passionate about women's safety IoT wearables.", avatar: "https://images.unsplash.com/photo-1517841905240-472988babdf9?w=100&auto=format&fit=crop&q=80" },
+        { name: "Sravani Rao", branch: "Computer Science ('26)", role: "UI/UX Product Designer", skills: ["Figma", "React", "Tailwind CSS"], bio: "Designed multiple campus apps. Obsessed with clean, accessible design systems.", avatar: "https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=100&auto=format&fit=crop&q=80" },
+        { name: "Divya Nallamothu", branch: "ECE ('26)", role: "VLSI & Hardware Systems Engineer", skills: ["MATLAB", "Verilog", "BLE Sensors"], bio: "ECE student with hands-on biomedical instrumentation lab experience.", avatar: "https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=100&auto=format&fit=crop&q=80" }
+      ],
+      mentors: [
+        { name: "Dr. K. Ramesh Rao", branch: "MRECW Incubation Cell", role: "Director of Innovation & Incubation (IIC)", skills: ["Patent Filing", "Hackathons", "Grant Proposals"], bio: "Guided 30+ MRECW student teams to win national hackathons.", avatar: "https://images.unsplash.com/photo-1472099645785-5658abf4ff4e?w=100&auto=format&fit=crop&q=80" },
+        { name: "Er. Swathi Kothapalli", branch: "MRECW Alumna ('17)", role: "Senior Engineering Lead at Microsoft", skills: ["Cloud Architecture", "System Design"], bio: "Proud MRECW alumna. Guides student founders on cloud architecture.", avatar: "https://images.unsplash.com/photo-1573496359142-b8d87734a5a2?w=100&auto=format&fit=crop&q=80" },
+        { name: "Pooja Chandrashekar", branch: "T-Hub Partner", role: "Venture Mentor & Angel Advisor", skills: ["Pitch Deck Review", "Fundraising"], bio: "Active angel mentor in Hyderabad's startup ecosystem.", avatar: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=100&auto=format&fit=crop&q=80" }
+      ],
+      leaderboard: [
+        { rank: 1, department: "Computer Science & Engineering (CSE)", startups: 28, teams: 64, funding: "₹5.8 Lakhs", badge: "🥇 Top Department" },
+        { rank: 2, department: "CSE - Artificial Intelligence & ML (AI&ML)", startups: 24, teams: 52, funding: "₹4.9 Lakhs", badge: "🥈 AI & DeepTech Leader" },
+        { rank: 3, department: "Information Technology (IT)", startups: 19, teams: 45, funding: "₹3.6 Lakhs", badge: "🥉 Cloud & Cyber Hub" },
+        { rank: 4, department: "Electronics & Communication (ECE)", startups: 16, teams: 38, funding: "₹2.8 Lakhs", badge: "IoT & Hardware Innovation" },
+        { rank: 5, department: "CSE - Data Science", startups: 14, teams: 32, funding: "₹2.4 Lakhs", badge: "Analytics & FinTech" },
+        { rank: 6, department: "Electrical & Electronics (EEE)", startups: 10, teams: 22, funding: "₹1.6 Lakhs", badge: "CleanTech & Smart Energy" }
+      ]
+    };
+
+    function switchTab(tab) {
+      appState.activeTab = tab;
+      document.querySelectorAll('.app-view-panel').forEach(p => p.classList.add('hidden'));
+      const active = document.getElementById(`view-${tab}`);
+      if (active) active.classList.remove('hidden');
+      document.querySelectorAll('.nav-link').forEach(link => {
+        link.classList.toggle('active', link.getAttribute('data-tab') === tab);
+      });
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      if (tab === 'home') renderMarketplace();
+      else if (tab === 'cofounders') renderCoFounders();
+      else if (tab === 'ailab') renderAILab();
+      else if (tab === 'mentors') renderMentors();
+    }
+
+    function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
+    function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
+
+    function showToast(msg) {
+      const c = document.getElementById('toast-container');
+      const t = document.createElement('div');
+      t.className = 'toast-item';
+      t.textContent = msg;
+      c.appendChild(t);
+      setTimeout(() => t.remove(), 3500);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, character => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      })[character]);
+    }
+
+    async function requestJson(path, options = {}) {
+      const headers = { 'Content-Type': 'application/json', ...options.headers };
+      if (appState.authSession?.access_token) {
+        headers.Authorization = `Bearer ${appState.authSession.access_token}`;
+      }
+      const response = await fetch(path, {
+        ...options,
+        headers
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || 'The request could not be completed.');
+      return result;
+    }
+
+    function supabaseIsConfigured() {
+      return Boolean(appState.supabaseClient);
+    }
+
+    async function initializeSupabase() {
+      const config = window.LAUNCHPAD_SUPABASE_CONFIG;
+      if (!config || !config.url || !config.anonKey) return;
+      appState.startups = [];
+      renderMarketplace();
+      if (!window.supabase?.createClient) {
+        throw new Error('Supabase client library did not load. Check your internet connection and reload.');
+      }
+
+      appState.supabaseClient = window.supabase.createClient(config.url, config.anonKey);
+      document.getElementById('auth-nav-button').classList.remove('hidden');
+      appState.supabaseClient.auth.onAuthStateChange((_event, session) => {
+        appState.authSession = session || null;
+        appState.authUser = session?.user || null;
+        updateAuthNavigation();
+      });
+      const { data, error } = await appState.supabaseClient.auth.getSession();
+      if (error) throw error;
+      appState.authSession = data.session || null;
+      appState.authUser = data.session?.user || null;
+      updateAuthNavigation();
+    }
+
+    function updateAuthNavigation() {
+      const button = document.getElementById('auth-nav-button');
+      if (!button) return;
+      button.textContent = appState.authUser ? 'Sign out' : 'Sign in';
+      button.title = appState.authUser?.email || 'Sign in to your MRECW account';
+    }
+
+    function handleAuthButton() {
+      if (!supabaseIsConfigured()) return;
+      if (appState.authUser) {
+        appState.supabaseClient.auth.signOut()
+          .then(({ error }) => {
+            if (error) throw error;
+            appState.authUser = null;
+            appState.authSession = null;
+            appState.pendingAuthAction = null;
+            updateAuthNavigation();
+            showToast('You have been signed out.');
+          })
+          .catch(error => showToast(`Could not sign out: ${error.message}`));
+        return;
+      }
+      openModal('modal-auth');
+    }
+
+    function handleLaunchStartup() {
+      if (supabaseIsConfigured() && !appState.authUser) {
+        appState.pendingAuthAction = 'publish';
+        showToast('Sign in before publishing a startup.');
+        openModal('modal-auth');
+        return;
+      }
+      openModal('modal-post-startup');
+    }
+
+    function updateAuthFields() {
+      const signup = document.getElementById('auth-mode').value === 'signup';
+      const fields = document.getElementById('auth-signup-fields');
+      const name = document.getElementById('auth-name');
+      const password = document.getElementById('auth-password');
+      fields.classList.toggle('hidden', !signup);
+      name.required = signup;
+      password.autocomplete = signup ? 'new-password' : 'current-password';
+      document.getElementById('auth-submit').textContent = signup ? 'Create account' : 'Sign in';
+    }
+
+    async function handleAuthSubmit(event) {
+      event.preventDefault();
+      if (!supabaseIsConfigured()) {
+        showToast('Supabase is not configured. Follow the Supabase setup guide.');
+        return;
+      }
+
+      const email = document.getElementById('auth-email').value.trim();
+      const password = document.getElementById('auth-password').value;
+      const signup = document.getElementById('auth-mode').value === 'signup';
+      const submit = document.getElementById('auth-submit');
+      submit.disabled = true;
+
+      try {
+        let result;
+        if (signup) {
+          result = await appState.supabaseClient.auth.signUp({
+            email,
+            password,
+            options: {
+              data: {
+                full_name: document.getElementById('auth-name').value.trim(),
+                department: document.getElementById('auth-department').value,
+                major: document.getElementById('auth-major').value.trim()
+              }
+            }
+          });
+        } else {
+          result = await appState.supabaseClient.auth.signInWithPassword({ email, password });
+        }
+
+        if (result.error) throw result.error;
+        if (signup && !result.data.session) {
+          closeModal('modal-auth');
+          showToast('Account created. Check your email to confirm it, then sign in.');
+          return;
+        }
+
+        appState.authSession = result.data.session || null;
+        appState.authUser = result.data.user;
+        updateAuthNavigation();
+        closeModal('modal-auth');
+        document.querySelector('#modal-auth form').reset();
+        updateAuthFields();
+        showToast(signup ? 'Your account is ready.' : 'Welcome back.');
+        if (appState.pendingAuthAction === 'publish') {
+          appState.pendingAuthAction = null;
+          openModal('modal-post-startup');
+        } else if (appState.pendingAuthAction === 'apply') {
+          appState.pendingAuthAction = null;
+          openModal('modal-join-team');
+        }
+      } catch (error) {
+        showToast(`Authentication failed: ${error.message}`);
+      } finally {
+        submit.disabled = false;
+      }
+    }
+
+    async function loadStartups() {
+      const records = await requestJson('/api/startups');
+      if (!Array.isArray(records)) throw new Error('The server returned an invalid startup list.');
+      appState.startups = records;
+      renderMarketplace();
+    }
+
+    function loadSavedStartups() {
+      try {
+        const savedIds = JSON.parse(localStorage.getItem('launchpad-saved-startups') || '[]');
+        if (!Array.isArray(savedIds) || !savedIds.every(id => typeof id === 'string')) {
+          throw new Error('Saved startup data has an unexpected format.');
+        }
+        appState.savedIds = new Set(savedIds);
+      } catch (error) {
+        console.error('Could not load saved startups from browser storage:', error);
+        showToast('Saved startups could not be loaded from this browser.');
+      }
+    }
+
+    function toggleSavedStartup(id) {
+      const nextSavedIds = new Set(appState.savedIds);
+      if (nextSavedIds.has(id)) nextSavedIds.delete(id);
+      else nextSavedIds.add(id);
+
+      try {
+        localStorage.setItem('launchpad-saved-startups', JSON.stringify([...nextSavedIds]));
+      } catch (error) {
+        console.error('Could not save startup in browser storage:', error);
+        showToast('Could not update saved startups in this browser.');
+        return;
+      }
+
+      appState.savedIds = nextSavedIds;
+      renderMarketplace();
+      showToast(nextSavedIds.has(id) ? 'Startup saved to your list.' : 'Startup removed from your saved list.');
+    }
+
+    function toggleSavedFilter(button) {
+      appState.showSavedOnly = !appState.showSavedOnly;
+      button.classList.toggle('active', appState.showSavedOnly);
+      button.setAttribute('aria-pressed', String(appState.showSavedOnly));
+      renderMarketplace();
+    }
+
+    function renderMarketplace() {
+      const grid = document.getElementById('marketplace-grid');
+      const filtered = appState.startups.filter(s => {
+        const matchCat = appState.activeCategory === 'all' || s.category === appState.activeCategory;
+        const matchDept = appState.activeCampus === 'all' || s.university.toLowerCase().includes(appState.activeCampus.toLowerCase());
+        const searchFields = [
+          s.name,
+          s.teamName,
+          s.tagline,
+          s.problem,
+          s.description,
+          s.lookingFor,
+          s.university,
+          s.founder.name,
+          s.founder.major,
+          s.category,
+          s.stage
+        ];
+        const matchSearch = !appState.searchQuery || searchFields.some(value => String(value || '').toLowerCase().includes(appState.searchQuery));
+        const matchSaved = !appState.showSavedOnly || appState.savedIds.has(s.id);
+        return matchCat && matchDept && matchSearch && matchSaved;
+      });
+
+      grid.innerHTML = filtered.map(s => `
+        <div class="startup-card">
+          <div class="card-top-cover" style="background-image: url('${escapeHtml(s.banner)}');">
+            <span class="category-tag-chip">${escapeHtml(s.category.toUpperCase())}</span>
+            <span class="stage-pill stage-${escapeHtml(s.stage.toLowerCase())}">${escapeHtml(s.stage)}</span>
+          </div>
+          <div class="card-main-content">
+            <div class="card-founder-strip">
+              <img src="${escapeHtml(s.founder.avatar)}" class="card-founder-img" alt="" />
+              <div class="founder-title-col">
+                <span class="founder-name-str">${escapeHtml(s.founder.name)} <span class="campus-verify-pill">✓ MRECW</span></span>
+                <span class="founder-sub-str">${escapeHtml(s.founder.major)} • <strong>${escapeHtml(s.university)}</strong></span>
+              </div>
+            </div>
+            <span class="team-badge-tag">${escapeHtml(s.teamName)}</span>
+            <h3 class="card-venture-title">${escapeHtml(s.name)}</h3>
+            <p class="card-venture-tagline">${escapeHtml(s.tagline)}</p>
+            <div class="card-role-box">
+              <span class="role-label">Looking for:</span>
+              <span class="role-val">${escapeHtml(s.lookingFor)}</span>
+            </div>
+          </div>
+          <div class="card-bottom-actions">
+            <button class="btn-save-toggle ${appState.savedIds.has(s.id) ? 'is-saved' : ''}"
+              aria-label="${appState.savedIds.has(s.id) ? 'Remove from saved startups' : 'Save startup'}"
+              aria-pressed="${appState.savedIds.has(s.id)}"
+              title="${appState.savedIds.has(s.id) ? 'Remove from saved startups' : 'Save startup'}"
+              onclick="toggleSavedStartup('${escapeHtml(s.id)}')">${appState.savedIds.has(s.id) ? '❤️' : '♡'}</button>
+            <div style="display: flex; gap: 0.45rem;">
+              <button class="btn btn-outline btn-sm" onclick="openPitchModal('${escapeHtml(s.id)}')">👁 Details</button>
+              <button class="btn btn-primary btn-sm" onclick="openJoinTeamModal('${escapeHtml(s.id)}')">🤝 Join Team</button>
+            </div>
+          </div>
+        </div>
+      `).join('') || '<p class="section-desc">No startups match those filters yet. Try another search or category.</p>';
+
+      renderLeaderboard();
+    }
+
+    function renderLeaderboard() {
+      const tbody = document.getElementById('leaderboard-tbody');
+      if (!tbody) return;
+      tbody.innerHTML = appState.leaderboard.map(lb => `
+        <tr style="border-bottom: 1px solid rgba(255,255,255,0.08); font-size: 0.85rem;">
+          <td style="padding: 0.85rem 1rem; font-weight: 800; color: #fff;">#${lb.rank}</td>
+          <td style="padding: 0.85rem 1rem;">
+            <strong style="color: #fff;">${lb.department}</strong>
+            <span style="font-size: 0.7rem; color: #f472b6; display: block;">${lb.badge}</span>
+          </td>
+          <td style="padding: 0.85rem 1rem; color: #94a3b8;">${lb.startups}</td>
+          <td style="padding: 0.85rem 1rem; color: #94a3b8;">${lb.teams}</td>
+          <td style="padding: 0.85rem 1rem; font-weight: 700; color: #34d399;">${lb.funding}</td>
+        </tr>
+      `).join('');
+    }
+
+    function openPitchModal(id) {
+      const s = appState.startups.find(x => x.id === id);
+      if (!s) return;
+      document.getElementById('modal-detail-body').innerHTML = `
+        <h2 style="font-size: 1.5rem; font-weight: 800; color: #fff; margin-bottom: 0.3rem;">${escapeHtml(s.name)} (${escapeHtml(s.teamName)})</h2>
+        <p style="font-size: 0.85rem; color: #38bdf8; margin-bottom: 1rem;">MRECW Department: ${escapeHtml(s.university)}</p>
+        <p style="font-size: 0.85rem; color: #cbd5e1; margin-bottom: 1rem;"><strong>Problem:</strong> ${escapeHtml(s.problem)}</p>
+        <p style="font-size: 0.85rem; color: #cbd5e1; margin-bottom: 1.25rem;"><strong>Solution:</strong> ${escapeHtml(s.description)}</p>
+        <div style="display: flex; justify-content: flex-end; gap: 0.5rem;">
+          <button class="btn btn-outline btn-sm" onclick="closeModal('modal-startup-detail')">Close</button>
+          <button class="btn btn-primary btn-sm" onclick="closeModal('modal-startup-detail'); openJoinTeamModal('${escapeHtml(s.id)}')">Apply to Join</button>
+        </div>
+      `;
+      openModal('modal-startup-detail');
+    }
+
+    function openFeaturedPitch() {
+      const featured = appState.startups.find(startup => startup.name === 'AgroVision AI');
+      if (featured) openPitchModal(featured.id);
+      else showToast('The featured startup is not available right now.');
+    }
+
+    function openFeaturedJoinTeam() {
+      const featured = appState.startups.find(startup => startup.name === 'AgroVision AI');
+      if (featured) openJoinTeamModal(featured.id);
+      else showToast('The featured startup is not available right now.');
+    }
+
+    function openJoinTeamModal(id) {
+      appState.selectedStartupId = id;
+      if (supabaseIsConfigured() && !appState.authUser) {
+        appState.pendingAuthAction = 'apply';
+        showToast('Sign in before applying to join a team.');
+        openModal('modal-auth');
+        return;
+      }
+      if (supabaseIsConfigured()) {
+        document.getElementById('applicant-name').value =
+          appState.authUser.user_metadata?.full_name || '';
+        document.getElementById('applicant-email').value = appState.authUser.email || '';
+        document.getElementById('applicant-email').readOnly = true;
+      } else {
+        document.getElementById('applicant-email').readOnly = false;
+      }
+      openModal('modal-join-team');
+    }
+
+    function handleCategoryFilter(cat, btn) {
+      appState.activeCategory = cat;
+      document.querySelectorAll('[data-category-filter]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderMarketplace();
+    }
+
+    function handleMarketplaceCampus(c) {
+      appState.activeCampus = c;
+      renderMarketplace();
+    }
+
+    function handleMarketplaceSearch(q) {
+      appState.searchQuery = q.toLowerCase().trim();
+      renderMarketplace();
+    }
+
+    function renderCoFounders() {
+      const grid = document.getElementById('cofounders-grid');
+      grid.innerHTML = appState.coFounders.map(cf => `
+        <div class="cofounder-card">
+          <div style="display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem;">
+            <img src="${cf.avatar}" class="cofounder-avatar" />
+            <div>
+              <h3 style="font-size: 1.05rem; font-weight: 800; color: #fff;">${cf.name}</h3>
+              <div style="font-size: 0.75rem; color: #38bdf8; font-weight: 700;">${cf.role}</div>
+              <div style="font-size: 0.725rem; color: #64748b;">${cf.branch}</div>
+            </div>
+          </div>
+          <p style="font-size: 0.825rem; color: #94a3b8; margin-bottom: 1rem; flex: 1;">${cf.bio}</p>
+          <div style="display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 1.25rem;">
+            ${cf.skills.map(sk => `<span class="skill-pill">${sk}</span>`).join('')}
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="showToast('Collaboration request sent to ${cf.name}!')">🤝 Connect with Co-Founder</button>
+        </div>
+      `).join('');
+    }
+
+    function renderMentors() {
+      const grid = document.getElementById('mentors-grid');
+      grid.innerHTML = appState.mentors.map(m => `
+        <div class="cofounder-card">
+          <div style="display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem;">
+            <img src="${m.avatar}" class="cofounder-avatar" />
+            <div>
+              <h3 style="font-size: 1.05rem; font-weight: 800; color: #fff;">${m.name}</h3>
+              <div style="font-size: 0.75rem; color: #38bdf8; font-weight: 700;">${m.role}</div>
+              <div style="font-size: 0.725rem; color: #f472b6;">${m.branch}</div>
+            </div>
+          </div>
+          <p style="font-size: 0.825rem; color: #94a3b8; margin-bottom: 1rem; flex: 1;">${m.bio}</p>
+          <div style="display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 1.25rem;">
+            ${m.skills.map(sk => `<span class="skill-pill">${sk}</span>`).join('')}
+          </div>
+          <button class="btn btn-primary btn-sm" onclick="showToast('Mentorship request booked with ${m.name}!')">Schedule 1-on-1 Mentorship ➔</button>
+        </div>
+      `).join('');
+    }
+
+    function renderAILab() {
+      document.getElementById('ailab-container').innerHTML = `
+        <div class="ai-lab-container">
+          <span style="font-size: 0.75rem; font-weight: 700; color: #38bdf8; text-transform: uppercase;">🤖 MRECW AI Assistant</span>
+          <h2 style="font-size: 1.6rem; font-weight: 800; color: #fff; margin: 0.4rem 0 1rem;">Instant Student Venture Generator</h2>
+          <div class="ai-prompt-box">
+            <span style="font-size: 1.25rem;">💡</span>
+            <input type="text" id="ai-prompt" value="I want to build an AI application for farmers in Telangana" />
+            <button class="btn btn-primary btn-sm" onclick="showToast('Generated 10-point plan!')">Generate Plan ⚡</button>
+          </div>
+          <div class="ai-result-grid">
+            <div class="ai-card"><div class="ai-card-title">1. Name Ideas</div><p class="ai-card-body">AgroVision AI, RythuMitra AI, CropSense MRECW</p></div>
+            <div class="ai-card"><div class="ai-card-title">2. Problem Solved</div><p class="ai-card-body">₹25,000+ Cr losses annually in rural farming due to delayed crop disease diagnosis.</p></div>
+            <div class="ai-card"><div class="ai-card-title">3. Tech Stack</div><p class="ai-card-body">PyTorch, YOLOv8, Flutter, FastAPI, SQLite Edge DB.</p></div>
+            <div class="ai-card"><div class="ai-card-title">4. Revenue Model</div><p class="ai-card-body">Freemium scans + ₹199/mo Pro AI + Agri vendor affiliates.</p></div>
+          </div>
+        </div>
+      `;
+    }
+
+    async function handlePostStartup(e) {
+      e.preventDefault();
+      const payload = {
+        name: document.getElementById('post-name').value.trim(),
+        teamName: document.getElementById('post-team').value.trim(),
+        category: document.getElementById('post-category').value,
+        department: document.getElementById('post-university').value,
+        tagline: document.getElementById('post-tagline').value.trim(),
+        lookingFor: document.getElementById('post-looking-for').value.trim()
+      };
+
+      try {
+        await requestJson('/api/startups', {
+          method: 'POST',
+          body: JSON.stringify(payload)
+        });
+        await loadStartups();
+        closeModal('modal-post-startup');
+        document.querySelector('#modal-post-startup form').reset();
+        showToast(`🚀 "${payload.name}" (${payload.teamName}) published!`);
+        switchTab('home');
+      } catch (error) {
+        showToast(`Could not publish startup: ${error.message}`);
+      }
+    }
+
+    async function handleJoinApplication(e) {
+      e.preventDefault();
+      if (supabaseIsConfigured() && !appState.authUser) {
+        closeModal('modal-join-team');
+        openModal('modal-auth');
+        showToast('Sign in before submitting an application.');
+        return;
+      }
+      const payload = {
+        startupId: appState.selectedStartupId,
+        applicantName: document.getElementById('applicant-name').value.trim(),
+        email: document.getElementById('applicant-email').value.trim(),
+        message: document.getElementById('application-message').value.trim()
+      };
+
+      try {
+        await requestJson('/api/applications', {
+          method: 'POST',
+          body: JSON.stringify(payload)
+        });
+        closeModal('modal-join-team');
+        document.querySelector('#modal-join-team form').reset();
+        showToast('Application submitted to the startup founder!');
+      } catch (error) {
+        showToast(`Could not submit application: ${error.message}`);
+      }
+    }
+
+    (function initAurora() {
+      const canvas = document.getElementById('aurora-canvas');
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      let w, h, step = 0;
+      function resize() { w = canvas.width = canvas.offsetWidth; h = canvas.height = canvas.offsetHeight; }
+      window.addEventListener('resize', resize);
+      resize();
+
+      function loop() {
+        step += 0.015;
+        ctx.clearRect(0, 0, w, h);
+        for (let i = 0; i < 6; i++) {
+          ctx.beginPath();
+          const grad = ctx.createLinearGradient(0, 0, w, 0);
+          grad.addColorStop(0, 'rgba(59, 130, 246, 0.1)');
+          grad.addColorStop(0.4, 'rgba(139, 92, 246, 0.45)');
+          grad.addColorStop(0.7, 'rgba(6, 182, 212, 0.4)');
+          grad.addColorStop(1, 'rgba(236, 72, 153, 0.25)');
+          ctx.strokeStyle = grad;
+          ctx.lineWidth = 1.8;
+          for (let x = 0; x <= w; x += 14) {
+            const y = (h * 0.7) + (i * 7) + Math.sin(x * 0.003 + step + i * 0.25) * 35;
+            if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        }
+        requestAnimationFrame(loop);
+      }
+      loop();
+    })();
+
+    window.addEventListener('DOMContentLoaded', () => {
+      loadSavedStartups();
+      renderMarketplace();
+      initializeSupabase()
+        .then(loadStartups)
+        .catch(error => showToast(`Could not load startups: ${error.message}`));
+    });
+
+==================== END FILE: frontend/js/app.js ====================
+
+==================== BEGIN FILE: frontend/js/supabase-config.js ====================
+window.LAUNCHPAD_SUPABASE_CONFIG = {
+  // Paste the Project URL and public anon/publishable key from Supabase here.
+  // Never use a service_role or secret key in this browser file.
+  url: 'https://kriggkcvovxgdlskctoo.supabase.co',
+  anonKey: 'sb_publishable_ZfGwC11n_nUuavGEvM1dMg_foLHCD0w'
+};
+
+==================== END FILE: frontend/js/supabase-config.js ====================
+
+==================== BEGIN FILE: supabase/schema.sql ====================
+-- LaunchPad MRECW database schema for Supabase (PostgreSQL).
+-- Run this file in the Supabase SQL Editor for a new project.
+
+create table if not exists public.startups (
+  id bigint generated by default as identity primary key,
+  founder_id uuid not null references auth.users (id) on delete cascade,
+  name text not null check (char_length(btrim(name)) between 1 and 100),
+  team_name text not null check (char_length(btrim(team_name)) between 1 and 100),
+  tagline text not null check (char_length(btrim(tagline)) between 1 and 300),
+  category text not null check (
+    category in (
+      'ai',
+      'agritech',
+      'edtech',
+      'healthtech',
+      'fintech',
+      'sustainability',
+      'ecommerce',
+      'robotics'
+    )
+  ),
+  department text not null check (
+    department in ('CSE - AI & ML', 'CSE', 'Data Science', 'IT', 'ECE', 'EEE')
+  ),
+  looking_for text not null check (char_length(btrim(looking_for)) between 1 and 150),
+  founder_name text not null check (char_length(btrim(founder_name)) between 1 and 100),
+  founder_major text not null default 'MRECW Student'
+    check (char_length(btrim(founder_major)) between 1 and 100),
+  founder_avatar text not null default ''
+    check (char_length(founder_avatar) <= 2048),
+  banner text not null default ''
+    check (char_length(banner) <= 2048),
+  stage text not null default 'Prototype'
+    check (stage in ('Idea', 'Prototype', 'MVP', 'Testing', 'Launch')),
+  problem text not null default 'Student venture submitted by an MRECW team.'
+    check (char_length(btrim(problem)) between 1 and 2000),
+  description text not null default 'A student-led venture from MRECW.'
+    check (char_length(btrim(description)) between 1 and 5000),
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.applications (
+  id bigint generated by default as identity primary key,
+  startup_id bigint not null
+    references public.startups (id) on delete cascade,
+  applicant_id uuid not null references auth.users (id) on delete cascade,
+  applicant_name text not null
+    check (char_length(btrim(applicant_name)) between 1 and 100),
+  email text not null
+    check (
+      char_length(btrim(email)) between 3 and 254
+      and btrim(email) ~ '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$'
+    ),
+  message text not null
+    check (char_length(btrim(message)) between 1 and 1000),
+  created_at timestamptz not null default now()
+);
+
+-- Add ownership columns when upgrading a database created from the earlier
+-- LaunchPad schema. Legacy rows remain ownerless until intentionally migrated.
+alter table public.startups
+  add column if not exists founder_id uuid references auth.users (id) on delete cascade;
+
+alter table public.applications
+  add column if not exists applicant_id uuid references auth.users (id) on delete cascade;
+
+create index if not exists idx_startups_category
+  on public.startups (category);
+
+create index if not exists idx_startups_department
+  on public.startups (department);
+
+create index if not exists idx_applications_startup
+  on public.applications (startup_id);
+
+create unique index if not exists idx_applications_startup_applicant_unique
+  on public.applications (startup_id, applicant_id);
+
+alter table public.startups enable row level security;
+alter table public.applications enable row level security;
+
+grant usage on schema public to anon, authenticated;
+revoke all on public.startups from anon, authenticated;
+revoke all on public.applications from anon, authenticated;
+revoke all on sequence public.startups_id_seq, public.applications_id_seq from anon, authenticated;
+grant select on public.startups to anon, authenticated;
+grant insert, update, delete on public.startups to authenticated;
+grant insert on public.applications to authenticated;
+grant usage, select on sequence public.startups_id_seq, public.applications_id_seq to authenticated;
+
+drop policy if exists "Anyone can view startups" on public.startups;
+create policy "Anyone can view startups"
+  on public.startups
+  for select
+  to anon, authenticated
+  using (true);
+
+drop policy if exists "Authenticated users can create startups" on public.startups;
+create policy "Authenticated users can create startups"
+  on public.startups
+  for insert
+  to authenticated
+  with check (founder_id = (select auth.uid()));
+
+drop policy if exists "Authenticated users can update startups" on public.startups;
+create policy "Authenticated users can update startups"
+  on public.startups
+  for update
+  to authenticated
+  using (founder_id = (select auth.uid()))
+  with check (founder_id = (select auth.uid()));
+
+drop policy if exists "Authenticated users can delete startups" on public.startups;
+create policy "Authenticated users can delete startups"
+  on public.startups
+  for delete
+  to authenticated
+  using (founder_id = (select auth.uid()));
+
+drop policy if exists "Authenticated users can submit applications" on public.applications;
+create policy "Authenticated users can submit applications"
+  on public.applications
+  for insert
+  to authenticated
+  with check (applicant_id = (select auth.uid()));
+
+-- Application records contain personal information. Do not grant anon or
+-- authenticated users a SELECT policy; read them only through a trusted,
+-- access-controlled server-side workflow.
+
+==================== END FILE: supabase/schema.sql ====================
+
+==================== BEGIN FILE: supabase/README.md ====================
+# Supabase setup
+
+The Supabase folder is a set of database setup files; creating a Supabase account does not create these files in your repository. `schema.sql` defines the PostgreSQL tables, constraints, indexes, and Row Level Security (RLS) policies for LaunchPad MRECW.
+
+## Apply the schema
+
+1. Create a Supabase project and open its **SQL Editor**.
+2. Open `supabase/schema.sql` from this repository, copy its contents into a new SQL query, and run it.
+3. In **Table Editor**, confirm that `startups` and `applications` were created.
+4. In **Authentication → URL Configuration**, set the site URL to your deployed website URL and add its URL to the redirect allow list.
+
+The schema allows anyone to read startup listings. Creating, updating, or deleting a startup is limited to its authenticated founder. Submitting an application requires authentication and associates it with the authenticated applicant. Application records have no client-readable policy or table grant because they contain names, email addresses, and messages.
+
+## Connect the Python API
+
+1. Copy `backend/.env.example` to `backend/.env`. This private file is ignored by Git.
+2. In the Supabase dashboard, open **Connect** and copy the PostgreSQL connection string. Use the session pooler if the direct connection is unavailable.
+3. Set `DATABASE_URL` in `backend/.env` to that private connection string.
+4. In **Project Settings → API**, copy the **Project URL** and public **anon** or **publishable** key. Set these as `SUPABASE_URL` and `SUPABASE_ANON_KEY` in `backend/.env`.
+5. Set the same Project URL and public anon/publishable key in `frontend/js/supabase-config.js`; the browser uses them only for Supabase Auth.
+6. Install backend dependencies from the project root using `python -m pip install -r backend\requirements.txt`, then restart the Python server.
+7. Create an account, confirm the email if Supabase requests it, and sign in. The frontend sends the access token to the Python API; the API verifies it with Supabase Auth and uses PostgreSQL for startup/application operations.
+
+When `DATABASE_URL` is set, the backend uses PostgreSQL and checks that the schema exists. When it is blank, the local SQLite database remains active. The Python API sets the verified user's PostgreSQL request role and user ID so the schema's RLS policies are enforced. Startup changes are founder-scoped; each applicant can submit one application per startup. Application rows are not readable through the client API.
+
+The Project URL and public anon/publishable key are safe for the browser; RLS remains essential. **Never put the PostgreSQL connection string, database password, `service_role` key, or any secret key in frontend code or GitHub.**
+
+The schema does not insert demo records. Existing SQLite records remain in `launchpad.db` and are not uploaded automatically. Export/import only records you intend to move; each startup needs a valid `founder_id` for a Supabase Auth user. The deployed website must use HTTPS and its exact origin must be allowed in Supabase Auth URL settings.
+
+==================== END FILE: supabase/README.md ====================
