@@ -1,6 +1,6 @@
 # LaunchPad MRECW
 
-LaunchPad MRECW is a student startup marketplace and innovation hub for Malla Reddy Engineering College for Women. The frontend is built with HTML, CSS, and vanilla JavaScript; the Python HTTP API can use local SQLite or Supabase PostgreSQL.
+LaunchPad MRECW is a student startup marketplace and innovation hub for Malla Reddy Engineering College for Women. The frontend is built with HTML, CSS, and vanilla JavaScript; the Python HTTP API can use local SQLite or Supabase PostgreSQL. And it is my project given at MRECW for (Full Stack Web development)
 
 ## Requirements
 
